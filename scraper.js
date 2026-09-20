@@ -3,7 +3,7 @@ const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 
 puppeteer.use(StealthPlugin());
 
-// درع حماية لمنع انهيار السكربت عند إغلاق صفحات الإعلانات المفاجئ
+// احتواء أخطاء إغلاق النوافذ المفاجئة من قِبل إعلانات الموقع
 process.on('unhandledRejection', (reason) => {
   if (reason && reason.message && reason.message.includes('Target closed')) return;
   console.log('⚠️ [تحذير تم احتواؤه]:', reason?.message || reason);
@@ -13,6 +13,7 @@ const PRIMARY_DOMAIN = 'https://mycima.bike';
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://zgxxpdmahcupysrgrhwt.supabase.co';
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 
+// القائمة الكاملة لأقسام وتصنيفات الموقع (18 قسماً)
 const CATEGORY_ORDER = [
   { path: '/', category: 'latest', type: 'movie' },
   { path: '/category/%d8%a7%d9%81%d9%84%d8%a7%d9%85-%d8%a7%d8%ac%d9%86%d8%a8%d9%8a/', category: 'movies_english', type: 'movie' },
@@ -53,7 +54,7 @@ async function db(endpoint, options = {}) {
   return text ? JSON.parse(text) : null;
 }
 
-// دالة تخطي فحص Turnstile
+// دالة تخطي مربع التحقق Cloudflare Turnstile
 async function solveTurnstileIfPresent(page) {
   try {
     const frames = page.frames();
@@ -82,7 +83,7 @@ async function solveTurnstileIfPresent(page) {
   return false;
 }
 
-// دالة تنقل آمنة
+// دالة تنقل آمنة تدعم التحقق والترويسة المرجعية
 async function safeNavigate(page, url, referer = '') {
   const options = { waitUntil: 'domcontentloaded', timeout: 60000 };
   if (referer) options.referer = referer;
@@ -92,7 +93,7 @@ async function safeNavigate(page, url, referer = '') {
   let retries = 0;
 
   while ((title.includes('Just a moment') || title.includes('Cloudflare') || title.includes('Attention Required')) && retries < 8) {
-    console.log(`⏳ فحص Cloudflare قيد الانتظار (محاولة ${retries + 1}/8)...`);
+    console.log(`⏳ فحص Cloudflare نشط... انتظار الحل (محاولة ${retries + 1}/8)...`);
     await solveTurnstileIfPresent(page);
     await new Promise(r => setTimeout(r, 3000));
     title = await page.title();
@@ -102,7 +103,7 @@ async function safeNavigate(page, url, referer = '') {
 }
 
 async function run() {
-  console.log('🚀 [v12 - Popunder Neutralizer & Resilient Scraper] بدء التشغيل...');
+  console.log('🚀 [v13 - Full Deep Metadata & Resilient Scraper] بدء التشغيل...');
 
   let state = (await db('scraper_state?id=eq.1&select=*'))?.[0];
   if (!state) {
@@ -136,7 +137,7 @@ async function run() {
   await pageTab.setViewport({ width: 1920, height: 1080 });
   await pageTab.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36');
 
-  // تعطيل النوافذ الإعلانية المنبثقة تماماً قبل تحميل أي صفحة
+  // تحييد النوافذ المنبثقة والإعلانات إجبارياً من الجذور
   await pageTab.evaluateOnNewDocument(() => {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     window.open = function () { return null; };
@@ -149,7 +150,7 @@ async function run() {
   const capturedEmbeds = [];
   const seenUrls = new Set();
 
-  // لاقط حركة الشبكة لاصطياد روابط الفيديو فقط وبدون تعطيل تدفق الصفحة
+  // تتبع حركة الشبكة لاصطياد روابط الفيديو والبث المباشر
   pageTab.on('request', (req) => {
     const u = req.url();
     if (u.includes('govid.live/video-') || u.includes('govid.live/play/') || u.includes('.m3u8') || u.includes('.mp4')) {
@@ -171,7 +172,7 @@ async function run() {
   const rootTitle = await safeNavigate(pageTab, `${PRIMARY_DOMAIN}/`);
   console.log(`🌐 تم تأكيد الجلسة بنجاح: "${rootTitle}"`);
 
-  // 2. فتح صفحة القسم المستهدفة
+  // 2. فتح صفحة القسم
   console.log(`🎯 فتح صفحة القسم المستهدفة...`);
   const targetTitle = await safeNavigate(pageTab, targetUrl, `${PRIMARY_DOMAIN}/`);
   console.log(`📄 عنوان صفحة القسم: "${targetTitle}"`);
@@ -212,7 +213,7 @@ async function run() {
 
   console.log(`📦 العناصر الفريدة المستخرجة: ${items.length} عنصر.`);
 
-  // 4. معالجة العناصر بدقة
+  // 4. معالجة العناصر واستخراج البيانات وروابط البث
   for (const item of items.slice(0, 10)) {
     try {
       console.log(`🔍 بدء فحص: ${item.title}`);
@@ -224,7 +225,7 @@ async function run() {
       const detailUrl = `${PRIMARY_DOMAIN}${item.path}`;
       await safeNavigate(pageTab, detailUrl, targetUrl);
 
-      // نقر زر المشغل لتفعيل البث مع تفادي التحويل الإجباري
+      // نقر زر المشغل لتفعيل البث المباشر
       await pageTab.evaluate(() => {
         const triggers = [
           'ul#watch li:first-child',
@@ -245,48 +246,60 @@ async function run() {
 
       await new Promise(r => setTimeout(r, 2200));
 
-      // استخراج القصة والتقييم مع حظر محتوى القوائم الجانبية
+      // استخراج القصة بدقة وسوم الـ SEO والميتا والتقييم والأنواع
       const pageDetails = await pageTab.evaluate(() => {
-        // حصر الاستخراج داخل الحاوية المركزية للعمل واستبعاد الأشرطة الجانبية
-        const mainScope = document.querySelector('singlesections, singlecontainer, main, .Grid--WecimaPosts') || document.body;
-
-        // 1. القصة (Story)
+        // 1. القصة (Story) - من وسوم الميتا الرسمية أو الوصف الداخلي
         let story = '';
-        const storySelectors = [
-          '.StoryMovieContent',
-          '.Story--Content',
-          '.PostStory',
-          '.single-story',
-          '.Poster--Single-Content p'
-        ];
-        for (const sel of storySelectors) {
-          const el = mainScope.querySelector(sel);
-          if (el && el.innerText.trim()) {
-            story = el.innerText.trim();
-            break;
+        const metaDesc = document.querySelector('meta[property="og:description"], meta[name="description"]');
+        if (metaDesc && metaDesc.content) {
+          story = metaDesc.content.trim();
+        }
+        
+        if (!story || story.length < 15) {
+          const storyEl = document.querySelector('.StoryMovieContent, .Story--Content, .PostStory, .single-story, [itemprop="description"]');
+          if (storyEl && storyEl.innerText.trim()) {
+            story = storyEl.innerText.trim();
           }
         }
 
+        // تنظيف القصة من العبارات الترويجية الثابتة
+        story = story.replace(/^(مشاهدة|تحميل)\s+(فيلم|مسلسل).*?(اون لاين|مترجم|مدبلج)\s*[:\-]?\s*/i, '').trim();
+
         // 2. التقييم (Rating)
         let rating = null;
-        const rateEl = mainScope.querySelector('.IMDB--Rating, .Rate--Single, [itemprop="ratingValue"], .imdb');
+        const rateEl = document.querySelector('.IMDB--Rating, .Rate--Single, [itemprop="ratingValue"], .imdb');
         if (rateEl) {
           const match = rateEl.innerText.match(/(\d+(\.\d+)?)/);
+          if (match) rating = parseFloat(match[1]);
+        }
+        if (!rating) {
+          const bodyText = document.body ? document.body.innerText : '';
+          const match = bodyText.match(/IMDb\s*[:\s]?\s*(\d+(\.\d+)?)/i) || bodyText.match(/(\d\.\d)\s*\/\s*10/);
           if (match) rating = parseFloat(match[1]);
         }
 
         // 3. التصنيفات الفرعية (Genres)
         const genres = [];
-        mainScope.querySelectorAll('a[href*="/genre/"], .Terms--List li a').forEach(a => {
+        document.querySelectorAll('a[href*="/genre/"], a[href*="/category/"]').forEach(a => {
           const txt = a.innerText.trim();
-          if (txt && !txt.includes('ماي سيما') && !txt.includes('وي سيما') && !genres.includes(txt)) {
+          const href = a.getAttribute('href') || '';
+          if (
+            txt && 
+            !txt.includes('ماي سيما') && 
+            !txt.includes('وي سيما') && 
+            !txt.includes('افلام') && 
+            !txt.includes('مسلسلات') && 
+            !txt.includes('الرئيسية') &&
+            !href.includes('/page/') &&
+            !genres.includes(txt)
+          ) {
             genres.push(txt);
           }
         });
 
-        // 4. سيرفرات الـ DOM
+        // 4. سيرفرات الـ DOM المكتوبة
         const domServers = [];
-        mainScope.querySelectorAll('ul#watch li, ul.WatchServersList li, [data-watch], [data-url]').forEach(li => {
+        document.querySelectorAll('ul#watch li, ul.WatchServersList li, [data-watch], [data-url]').forEach(li => {
           const url = li.getAttribute('data-watch') || li.getAttribute('data-url');
           const name = li.innerText.trim() || 'سيرفر مشاهدة';
           if (url && !url.startsWith('#') && !url.startsWith('javascript:')) {
@@ -318,7 +331,7 @@ async function run() {
       const primaryStreamUrl = directPlayUrl || finalServers[0]?.url || detailUrl;
       const contentType = target.type === 'series' || item.isSeries ? 'series' : target.type;
 
-      // حفظ السجل في Supabase
+      // حفظ السجل كاملاً في Supabase
       await db('contents?on_conflict=page_url', {
         method: 'POST',
         headers: { 'Prefer': 'resolution=merge-duplicates' },
@@ -350,7 +363,7 @@ async function run() {
 
   await browser.close();
 
-  // تحديث مؤشر الدورة القادمة
+  // تحديث المؤشر للدورة القادمة
   let nextIndex = targetIndex;
   let nextPage = page + 1;
   if (items.length === 0 || page >= 30) {
