@@ -2,8 +2,9 @@ name: Auto Scraper Cron
 
 on:
   schedule:
+    # يعمل تلقائياً كل 30 دقيقة على مدار الساعة
     - cron: '*/30 * * * *'
-  workflow_dispatch:
+  workflow_dispatch: # يتيح زر التشغيل اليدوي في أي وقت
 
 jobs:
   scrape-and-sync:
@@ -29,4 +30,4 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-        run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" node scraper.js
+        run: node scraper.js
