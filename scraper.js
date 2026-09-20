@@ -102,7 +102,7 @@ async function safeNavigate(page, url, referer = '') {
   return title;
 }
 
-// دالة تنظيف العناوين لواجهة المستخدم
+// دالة تنظيف العناوين
 function sanitizeTitle(rawTitle) {
   return rawTitle
     .replace(/^مشاهدة\s+/i, '')
@@ -113,13 +113,12 @@ function sanitizeTitle(rawTitle) {
     .trim();
 }
 
-// معالجة وفحص صفحة العمل بشكل معزول
+// معالجة وفحص صفحة العمل واستخراج السيرفرات والتفاصيل
 async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targetType) {
   const itemTab = await browser.newPage();
   await itemTab.setViewport({ width: 1920, height: 1080 });
   await itemTab.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36');
 
-  // تحصين التبويب ضد الإعلانات المنبثقة
   await itemTab.evaluateOnNewDocument(() => {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     window.open = () => null;
@@ -157,57 +156,86 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
     // تفعيل المشغل بهدوء إن وجد
     try {
       await itemTab.evaluate(() => {
-        const btn = document.querySelector('ul#watch li:first-child, .Watch--Btn, .btn--watch');
+        const btn = document.querySelector('ul#watch li:first-child, .WatchServersList li:first-child, .Watch--Btn, .btn--watch');
         if (btn) btn.click();
       });
     } catch (e) {}
 
     await new Promise(r => setTimeout(r, 1800));
 
-    // استخراج بيانات الـ DOM بدقة تامة بعد مطابقتها مع شفرة المصدر
+    // استخراج بيانات الـ DOM بدقة شاملة للأفلام والمسلسلات
     const pageDetails = await itemTab.evaluate(() => {
-      // 1. القصة النقية (من الكلاس المخصص أو الميتا)
+      // 1. القصة الشاملة (البحث في كافة الكلاسات والميتا)
       let story = '';
-      const storyEl = document.querySelector('.StoryMovieContent');
-      if (storyEl && storyEl.innerText.trim()) {
-        story = storyEl.innerText.trim();
-      } else {
-        const metaDesc = document.querySelector('meta[itemprop="description"], meta[name="description"]');
-        if (metaDesc && metaDesc.content) story = metaDesc.content.trim();
+      const storySelectors = [
+        '.StoryMovieContent',
+        '.Story--Content',
+        '.PostStory',
+        '.single-story',
+        'div.Story',
+        '.AsideContext div',
+        '.Poster--Single-Content p',
+        '.PostItemContent p',
+        '.PostItemContent [itemprop="description"]'
+      ];
+      
+      for (const sel of storySelectors) {
+        const el = document.querySelector(sel);
+        if (el && el.innerText.trim() && el.innerText.trim().length > 15) {
+          story = el.innerText.trim();
+          break;
+        }
       }
 
-      // 2. استخراج جميع سيرفرات المشاهدة المباشرة الجاهزة في الصفحة
+      if (!story) {
+        const metaSelectors = [
+          'meta[property="og:description"]',
+          'meta[itemprop="description"]',
+          'meta[name="description"]'
+        ];
+        for (const m of metaSelectors) {
+          const el = document.querySelector(m);
+          if (el && el.content && el.content.trim().length > 15) {
+            story = el.content.trim();
+            break;
+          }
+        }
+      }
+
+      // تنظيف العبارات الترويجية الثابتة إن وُجدت
+      story = story.replace(/^(مشاهدة|تحميل)\s+(فيلم|مسلسل).*?(اون لاين|مترجم|مدبلج)\s*[:\-]?\s*/i, '').trim();
+
+      // 2. استخراج جميع سيرفرات المشاهدة المكتوبة في الصفحة
       const domServers = [];
-      document.querySelectorAll('ul#watch li[data-watch]').forEach(li => {
-        const url = li.getAttribute('data-watch');
+      const serverElements = document.querySelectorAll('ul#watch li, .WatchServersList li, [data-watch], [data-url]');
+      serverElements.forEach(li => {
+        let url = li.getAttribute('data-watch') || li.getAttribute('data-url');
         const name = li.innerText.trim() || 'سيرفر مشاهدة';
-        if (url && url.startsWith('http')) {
+        if (url && !url.startsWith('#') && !url.startsWith('javascript:')) {
+          if (url.startsWith('//')) url = 'https:' + url;
           domServers.push({ name, url });
         }
       });
 
       // 3. التقييم
       let rating = null;
-      const rateEl = document.querySelector('.IMDB--Rating, .Rate--Single, [itemprop="ratingValue"], .imdb');
+      const rateEl = document.querySelector('.IMDB--Rating, .Rate--Single, [itemprop="ratingValue"], .imdb, .rating');
       if (rateEl) {
         const match = rateEl.innerText.match(/(\d+(\.\d+)?)/);
         if (match) rating = parseFloat(match[1]);
       }
+      if (!rating) {
+        const bodyTxt = document.body ? document.body.innerText : '';
+        const m = bodyTxt.match(/IMDb\s*[:\s]?\s*(\d+(\.\d+)?)/i) || bodyTxt.match(/(\d\.\d)\s*\/\s*10/);
+        if (m) rating = parseFloat(m[1]);
+      }
 
-      // 4. التصنيفات من قائمة الشروط أو الأنواع
+      // 4. التصنيفات الخاصة بالعمل
       const genres = [];
-      document.querySelectorAll('a[href*="/genre/"], .Terms--Content--Single-begin li p a').forEach(a => {
+      document.querySelectorAll('a[href*="/genre/"], .Terms--List li a, .Terms--Content--Single-begin li p a').forEach(a => {
         const txt = a.innerText.trim();
-        const href = a.getAttribute('href') || '';
-        if (
-          txt &&
-          !txt.includes('ماي سيما') &&
-          !txt.includes('وي سيما') &&
-          !txt.includes('مسلسلات') &&
-          !txt.includes('افلام') &&
-          !href.includes('/category/') &&
-          !genres.includes(txt)
-        ) {
+        const badWords = ['ماي سيما', 'وي سيما', 'الرئيسية', 'افلام عربي', 'مسلسلات عربي', 'افلام اجنبي', 'مسلسلات اجنبي'];
+        if (txt && !badWords.some(w => txt.includes(w)) && !genres.includes(txt)) {
           genres.push(txt);
         }
       });
@@ -239,7 +267,7 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
 
     itemTab.off('request', networkSniffer);
 
-    // دمج السيرفرات المكتشفة مع روابط الشبكة
+    // دمج السيرفرات وترتيبها
     const allServers = [...capturedEmbeds, ...pageDetails.domServers];
     if (directPlayUrl) {
       allServers.unshift({ name: 'بث مباشر رئيسي (Direct)', url: directPlayUrl });
@@ -262,7 +290,7 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
     const contentType = isSeriesItem ? 'series' : targetType;
     const cleanTitle = sanitizeTitle(item.title);
 
-    // حفظ السجل كاملاً في Supabase مع تصفير أي أخطاء سابقة
+    // حفظ السجل كاملاً في Supabase
     await db('contents?on_conflict=page_url', {
       method: 'POST',
       headers: { 'Prefer': 'resolution=merge-duplicates' },
@@ -281,7 +309,6 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
           story: pageDetails.story || null,
           rating: pageDetails.rating || null,
           genres: pageDetails.genres || [],
-          // بيانات المسلسلات
           series_title: pageDetails.seriesTitle || null,
           series_url: pageDetails.seriesUrl || null,
           season_name: pageDetails.seasonName || null,
@@ -332,7 +359,7 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
 }
 
 async function run() {
-  console.log('🚀 [v16 - Cross-Category Page Rotation & Accurate Media Engine] بدء التشغيل...');
+  console.log('🚀 [v17 - Comprehensive Selectors & Strict Horizontal Page Rotation] بدء التشغيل...');
 
   let state = (await db('scraper_state?id=eq.1&select=*'))?.[0];
   if (!state) {
@@ -341,7 +368,8 @@ async function run() {
     state = defaultState[0];
   }
 
-  let targetIndex = state.target_index % CATEGORY_ORDER.length;
+  // التدوير الصارم: القسم الحالي ضمن الصفحة الحالية
+  let targetIndex = (state.target_index || 0) % CATEGORY_ORDER.length;
   let page = state.current_page || 1;
   const target = CATEGORY_ORDER[targetIndex];
 
@@ -366,7 +394,7 @@ async function run() {
   await mainTab.setViewport({ width: 1920, height: 1080 });
   await mainTab.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36');
 
-  // 1. فتح الصفحة الرئيسية لتوثيق الجلسة وحصد الكوكيز الصالحة
+  // 1. فتح الصفحة الرئيسية لتوثيق الجلسة
   console.log('🔑 توثيق الجلسة عبر الصفحة الرئيسية...');
   const rootTitle = await safeNavigate(mainTab, `${PRIMARY_DOMAIN}/`);
   console.log(`🌐 تم تأكيد الجلسة بنجاح: "${rootTitle}"`);
@@ -439,7 +467,7 @@ async function run() {
 
   console.log(`📦 العناصر الفريدة المستخرجة: ${items.length} عنصر.`);
 
-  // 4. معالجة العناصر في تبويبات معزولة ومستقلة
+  // 4. معالجة العناصر في تبويبات معزولة
   for (const item of items.slice(0, 10)) {
     console.log(`🔍 بدء فحص: ${item.title}`);
     await scrapeSingleItem(browser, item, targetUrl, target.category, target.type);
@@ -449,19 +477,19 @@ async function run() {
   await browser.close();
 
   // -------------------------------------------------------------
-  // 5. آلية التدوير: التنقل بين الأقسام على نفس الصفحة أولاً، ثم الانتقال للصفحة التالية
+  // 5. التدوير الأفقي: إنهاء الصفحة الحالية لكافة الأقسام الـ 18، ثم الانتقال للصفحة التالية
   // -------------------------------------------------------------
   let nextIndex = targetIndex + 1;
   let nextPage = page;
 
-  // إذا أنهينا القسم الأخير (18)، نعود للقسم الأول وننتقل للصفحة التالية (دورة جديدة)
+  // عند الانتهاء من القسم الأخير (18)، نعود للقسم الأول وننتقل للصفحة التالية
   if (nextIndex >= CATEGORY_ORDER.length) {
     nextIndex = 0;
     nextPage = page + 1;
-    console.log(`🏁 اكتملت دورة الصفحة (${page}) لجميع الأقسام الـ 18 بنجاح! الانتقال لدورة الصفحة (${nextPage})...`);
+    console.log(`🏁 اكتملت دورة الصفحة (${page}) لجميع الأقسام الـ 18! الانتقال الآن لدورة الصفحة (${nextPage})...`);
   }
 
-  // إذا تجاوزت الصفحات الحد الأقصى للأرشفة (50 صفحة)، نعود للصفحة 1
+  // إعادة التدوير بعد الصفحة 50
   if (nextPage > 50) {
     nextPage = 1;
   }
@@ -471,7 +499,7 @@ async function run() {
     body: JSON.stringify({ target_index: nextIndex, current_page: nextPage })
   });
 
-  console.log(`🎉 اكتملت التشغيلة بنجاح. المحطة التالية: [دورة الصفحة ${nextPage}] - قسم ${CATEGORY_ORDER[nextIndex].category} (${nextIndex + 1}/${CATEGORY_ORDER.length})`);
+  console.log(`🎉 اكتملت الدورة بنجاح. المحطة التالية: [دورة الصفحة ${nextPage}] - قسم ${CATEGORY_ORDER[nextIndex].category} (${nextIndex + 1}/${CATEGORY_ORDER.length})`);
 }
 
 run().catch(err => {
