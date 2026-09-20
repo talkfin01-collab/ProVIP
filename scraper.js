@@ -34,8 +34,23 @@ async function db(endpoint, options = {}) {
   return text ? JSON.parse(text) : null;
 }
 
+// دالة تنقل ذكية تنتظر فك حظر Cloudflare قبل المتابعة
+async function safeNavigate(page, url) {
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  let title = await page.title();
+  let retries = 0;
+
+  while ((title.includes('Just a moment') || title.includes('Cloudflare') || title.includes('Attention Required')) && retries < 15) {
+    console.log(`⏳ فحص Cloudflare نشط... انتظار الحل (محاولة ${retries + 1}/15)`);
+    await new Promise(r => setTimeout(r, 4000));
+    title = await page.title();
+    retries++;
+  }
+  return title;
+}
+
 async function run() {
-  console.log('🚀 [v3 - حفظ مباشر وفحص السيرفرات] بدء التشغيل...');
+  console.log('🚀 [v4 - استخراج السيرفرات وإعادة استخدام الجلسة] بدء التشغيل...');
 
   let state = (await db('scraper_state?id=eq.1&select=*'))?.[0];
   if (!state) {
@@ -73,17 +88,10 @@ async function run() {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
   });
 
-  await pageTab.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  const mainTitle = await safeNavigate(pageTab, targetUrl);
+  console.log(`✅ تم فتح القسم بنجاح: "${mainTitle}"`);
 
-  let title = await pageTab.title();
-  let retries = 0;
-  while ((title.includes('Just a moment') || title.includes('Cloudflare') || title.includes('Attention Required')) && retries < 8) {
-    console.log(`⏳ جاري تخطي Cloudflare... (محاولة ${retries + 1}/8)`);
-    await new Promise(r => setTimeout(r, 4000));
-    title = await pageTab.title();
-  }
-
-  // استخراج البطاقات بدون تكرار
+  // استخراج قائمة العناصر وحفظها في الذاكرة
   const rawItems = await pageTab.evaluate(() => {
     const list = [];
     const elements = document.querySelectorAll('.Thumb--GridItem');
@@ -113,7 +121,6 @@ async function run() {
     return list;
   });
 
-  // تصفية العناصر المكررة حسب المسار (path)
   const uniqueMap = new Map();
   for (const it of rawItems) {
     if (!uniqueMap.has(it.path)) uniqueMap.set(it.path, it);
@@ -122,51 +129,73 @@ async function run() {
 
   console.log(`📦 العناصر الفريدة المستخرجة: ${items.length} عنصر.`);
 
-  // معالجة أول 10 عناصر
-  for (const item of items.slice(0, 10)) {
+  // معالجة العناصر باستخدام نفس التبويب للحفاظ على كوكيز الجلسة وتخطي الحظر
+  for (const item of items.slice(0, 8)) {
     try {
-      console.log(`🔍 جلب صفحة: ${item.title}`);
-      const detailTab = await browser.newPage();
-      await detailTab.goto(`${PRIMARY_DOMAIN}${item.path}`, { waitUntil: 'domcontentloaded', timeout: 35000 });
-      await new Promise(r => setTimeout(r, 2500));
+      console.log(`🔍 جلب تفاصيل: ${item.title}`);
+      const detailUrl = `${PRIMARY_DOMAIN}${item.path}`;
+      const detailTitle = await safeNavigate(pageTab, detailUrl);
 
-      const pageData = await detailTab.evaluate(() => {
+      // فحص واستخراج كافة السيرفرات والروابط
+      const pageData = await pageTab.evaluate(() => {
         const servers = [];
-        
-        // 1. فحص قوائم المشاهدة المعتادة
-        document.querySelectorAll('ul#watch li, ul.WatchServersList li, .servers--list li').forEach(li => {
-          const url = li.getAttribute('data-watch') || li.getAttribute('data-url') || li.querySelector('a')?.getAttribute('href');
-          const name = li.innerText.trim() || 'سيرفر';
-          if (url && !url.startsWith('#')) servers.push({ name, url });
+
+        // 1. فحص عناصر السيرفرات المعتادة
+        const selectors = [
+          'ul#watch li',
+          'ul.WatchServersList li',
+          '.servers--list li',
+          '.Watch--Servers--List li',
+          'ul.List--Download--Wecima--Single li a',
+          '[data-watch]',
+          '[data-url]'
+        ];
+
+        selectors.forEach(sel => {
+          document.querySelectorAll(sel).forEach(el => {
+            const url = el.getAttribute('data-watch') || el.getAttribute('data-url') || el.getAttribute('href');
+            const name = el.innerText.trim() || el.getAttribute('title') || 'سيرفر مشاهدة';
+            if (url && !url.startsWith('#') && !url.startsWith('javascript:')) {
+              servers.push({ name, url });
+            }
+          });
         });
 
-        // 2. فحص أزرار المشاهدة المباشرة
-        if (servers.length === 0) {
-          document.querySelectorAll('a.btn--watch, a[href*="/watch/"]').forEach(a => {
-            const url = a.getAttribute('href');
-            if (url) servers.push({ name: 'مشاهدة مباشرة', url });
-          });
-        }
+        // 2. فحص مشغلات iframes المدمجة
+        document.querySelectorAll('iframe').forEach(iframe => {
+          const src = iframe.getAttribute('src') || iframe.getAttribute('data-src');
+          if (src && !src.includes('google') && !src.includes('ad')) {
+            servers.push({ name: 'سيرفر مضمن (Player)', url: src });
+          }
+        });
 
-        // 3. استخراج أسماء الأزرار المتاحة في حال عدم وجود سيرفرات لتشخيص الهيكل
-        const sampleButtons = Array.from(document.querySelectorAll('a, button, ul li'))
+        // 3. التقاط نص أزرار المشاهدة للتشخيص إن لم توجد روابط
+        const buttons = Array.from(document.querySelectorAll('a, button, li'))
           .map(e => e.innerText.trim())
-          .filter(t => t.includes('سيرفر') || t.includes('مشاهدة') || t.includes('تحميل'))
+          .filter(t => t.includes('مشاهدة') || t.includes('سيرفر') || t.includes('تحميل'))
           .slice(0, 5);
 
-        return { servers, sampleButtons };
+        return { servers, buttons, title: document.title };
       });
 
-      await detailTab.close();
-
-      console.log(`📡 عدد السيرفرات المكتشفة لـ (${item.title}): ${pageData.servers.length}`);
-      if (pageData.servers.length === 0 && pageData.sampleButtons.length > 0) {
-        console.log(`ℹ️ أزرار المشاهدة المتوفرة في الصفحة: ${pageData.sampleButtons.join(' | ')}`);
+      // إزالة السيرفرات المكررة
+      const uniqueServers = [];
+      const seenUrls = new Set();
+      for (const s of pageData.servers) {
+        if (!seenUrls.has(s.url)) {
+          seenUrls.add(s.url);
+          uniqueServers.push(s);
+        }
       }
 
-      // حفظ المحتوى في Supabase
-      const primaryStreamUrl = pageData.servers[0]?.url || `${PRIMARY_DOMAIN}${item.path}`;
-      
+      console.log(`📡 عدد السيرفرات لـ (${item.title}): ${uniqueServers.length}`);
+      if (uniqueServers.length === 0 && pageData.buttons.length > 0) {
+        console.log(`ℹ️ أزرار المشاهدة المكتشفة: ${pageData.buttons.join(' | ')}`);
+      }
+
+      const primaryStreamUrl = uniqueServers[0]?.url || detailUrl;
+
+      // حفظ أو تحديث البيانات في Supabase
       await db('contents?on_conflict=page_url', {
         method: 'POST',
         headers: { 'Prefer': 'resolution=merge-duplicates' },
@@ -178,12 +207,12 @@ async function run() {
           poster_url: item.poster,
           stream_url: primaryStreamUrl,
           page_url: item.path,
-          extra_data: { servers: pageData.servers },
+          extra_data: { servers: uniqueServers },
           updated_at: new Date().toISOString()
         }])
       });
 
-      console.log(`✅ تم الحفظ في قاعدة البيانات: ${item.title}`);
+      console.log(`✅ تم التحديث في Supabase: ${item.title} (سيرفرات: ${uniqueServers.length})`);
 
     } catch (err) {
       console.log(`⚠️ تخطي ${item.title}: ${err.message}`);
@@ -192,7 +221,7 @@ async function run() {
 
   await browser.close();
 
-  // الانتقال للصفحة التالية
+  // الانتقال إلى الصفحة أو القسم التالي
   let nextIndex = targetIndex;
   let nextPage = page + 1;
   if (items.length === 0 || page >= 30) {
@@ -205,7 +234,7 @@ async function run() {
     body: JSON.stringify({ target_index: nextIndex, current_page: nextPage })
   });
 
-  console.log(`🎉 اكتملت الدورة. الانتقال القادم: قسم ${nextIndex} صفحة ${nextPage}`);
+  console.log(`🎉 انتهت الدورة. المحطة التالية: قسم ${nextIndex} صفحة ${nextPage}`);
 }
 
 run().catch(err => {
