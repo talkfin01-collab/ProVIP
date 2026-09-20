@@ -34,14 +34,48 @@ async function db(endpoint, options = {}) {
   return text ? JSON.parse(text) : null;
 }
 
-// دالة تنقل ذكية تنتظر فك حظر Cloudflare قبل المتابعة
+// دالة تخطي ونقر مربع التحقق الخاص بـ Cloudflare
+async function solveTurnstile(page) {
+  try {
+    const frames = page.frames();
+    for (const frame of frames) {
+      if (frame.url().includes('cloudflare') || frame.url().includes('turnstile')) {
+        const checkbox = await frame.$('input[type="checkbox"], .ctp-checkbox-label, #challenge-stage');
+        if (checkbox) {
+          console.log('👆 تم اكتشاف مربع Turnstile... جاري النقر عليه...');
+          await checkbox.click();
+          await new Promise(r => setTimeout(r, 3000));
+          return true;
+        }
+      }
+    }
+
+    // محاولة ثانية بالنقر على إطار الـ Iframe مباشرة إن لم يتم الوصول لداخله
+    const iframeElement = await page.$('iframe[src*="cloudflare"], iframe[src*="turnstile"]');
+    if (iframeElement) {
+      const rect = await iframeElement.boundingBox();
+      if (rect) {
+        console.log('👆 النقر المباشر على إحداثيات نافذة التحقق...');
+        await page.mouse.click(rect.x + 25, rect.y + 25);
+        await new Promise(r => setTimeout(r, 3000));
+        return true;
+      }
+    }
+  } catch (e) {
+    // تجاهل أخطاء النقر المؤقتة
+  }
+  return false;
+}
+
+// دالة تنقل ذكية تتحقق من فك الحظر
 async function safeNavigate(page, url) {
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
   let title = await page.title();
   let retries = 0;
 
-  while ((title.includes('Just a moment') || title.includes('Cloudflare') || title.includes('Attention Required')) && retries < 15) {
-    console.log(`⏳ فحص Cloudflare نشط... انتظار الحل (محاولة ${retries + 1}/15)`);
+  while ((title.includes('Just a moment') || title.includes('Cloudflare') || title.includes('Attention Required')) && retries < 12) {
+    console.log(`⏳ فحص Cloudflare قيد الانتظار (محاولة ${retries + 1}/12)...`);
+    await solveTurnstile(page);
     await new Promise(r => setTimeout(r, 4000));
     title = await page.title();
     retries++;
@@ -50,7 +84,7 @@ async function safeNavigate(page, url) {
 }
 
 async function run() {
-  console.log('🚀 [v4 - استخراج السيرفرات وإعادة استخدام الجلسة] بدء التشغيل...');
+  console.log('🚀 [v5 - Real Headful + Turnstile Auto-Clicker] بدء التشغيل...');
 
   let state = (await db('scraper_state?id=eq.1&select=*'))?.[0];
   if (!state) {
@@ -69,14 +103,15 @@ async function run() {
 
   console.log(`🌐 الرابط المستهدف: ${targetUrl} (قسم: ${target.category} | صفحة: ${page})`);
 
+  // تشغيل متصفح حقيقي مرئي داخل xvfb
   const browser = await puppeteer.launch({
-    headless: 'new',
+    headless: false,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
-      '--disable-blink-features=AutomationControlled',
-      '--window-size=1920,1080'
+      '--window-size=1920,1080',
+      '--disable-blink-features=AutomationControlled'
     ]
   });
 
@@ -84,19 +119,13 @@ async function run() {
   await pageTab.setViewport({ width: 1920, height: 1080 });
   await pageTab.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36');
 
-  await pageTab.evaluateOnNewDocument(() => {
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-  });
-
   const mainTitle = await safeNavigate(pageTab, targetUrl);
-  console.log(`✅ تم فتح القسم بنجاح: "${mainTitle}"`);
+  console.log(`📄 عنوان الصفحة النهائي: "${mainTitle}"`);
 
-  // استخراج قائمة العناصر وحفظها في الذاكرة
+  // استخراج البطاقات
   const rawItems = await pageTab.evaluate(() => {
     const list = [];
-    const elements = document.querySelectorAll('.Thumb--GridItem');
-
-    elements.forEach(el => {
+    document.querySelectorAll('.Thumb--GridItem').forEach(el => {
       const linkEl = el.querySelector('a');
       if (!linkEl) return;
       const rawHref = linkEl.getAttribute('href') || '';
@@ -129,18 +158,15 @@ async function run() {
 
   console.log(`📦 العناصر الفريدة المستخرجة: ${items.length} عنصر.`);
 
-  // معالجة العناصر باستخدام نفس التبويب للحفاظ على كوكيز الجلسة وتخطي الحظر
+  // معالجة العناصر
   for (const item of items.slice(0, 8)) {
     try {
-      console.log(`🔍 جلب تفاصيل: ${item.title}`);
+      console.log(`🔍 جلب صفحة: ${item.title}`);
       const detailUrl = `${PRIMARY_DOMAIN}${item.path}`;
-      const detailTitle = await safeNavigate(pageTab, detailUrl);
+      await safeNavigate(pageTab, detailUrl);
 
-      // فحص واستخراج كافة السيرفرات والروابط
       const pageData = await pageTab.evaluate(() => {
         const servers = [];
-
-        // 1. فحص عناصر السيرفرات المعتادة
         const selectors = [
           'ul#watch li',
           'ul.WatchServersList li',
@@ -161,24 +187,16 @@ async function run() {
           });
         });
 
-        // 2. فحص مشغلات iframes المدمجة
         document.querySelectorAll('iframe').forEach(iframe => {
           const src = iframe.getAttribute('src') || iframe.getAttribute('data-src');
           if (src && !src.includes('google') && !src.includes('ad')) {
-            servers.push({ name: 'سيرفر مضمن (Player)', url: src });
+            servers.push({ name: 'مشغل مدمج', url: src });
           }
         });
 
-        // 3. التقاط نص أزرار المشاهدة للتشخيص إن لم توجد روابط
-        const buttons = Array.from(document.querySelectorAll('a, button, li'))
-          .map(e => e.innerText.trim())
-          .filter(t => t.includes('مشاهدة') || t.includes('سيرفر') || t.includes('تحميل'))
-          .slice(0, 5);
-
-        return { servers, buttons, title: document.title };
+        return { servers };
       });
 
-      // إزالة السيرفرات المكررة
       const uniqueServers = [];
       const seenUrls = new Set();
       for (const s of pageData.servers) {
@@ -189,13 +207,8 @@ async function run() {
       }
 
       console.log(`📡 عدد السيرفرات لـ (${item.title}): ${uniqueServers.length}`);
-      if (uniqueServers.length === 0 && pageData.buttons.length > 0) {
-        console.log(`ℹ️ أزرار المشاهدة المكتشفة: ${pageData.buttons.join(' | ')}`);
-      }
-
       const primaryStreamUrl = uniqueServers[0]?.url || detailUrl;
 
-      // حفظ أو تحديث البيانات في Supabase
       await db('contents?on_conflict=page_url', {
         method: 'POST',
         headers: { 'Prefer': 'resolution=merge-duplicates' },
@@ -212,8 +225,7 @@ async function run() {
         }])
       });
 
-      console.log(`✅ تم التحديث في Supabase: ${item.title} (سيرفرات: ${uniqueServers.length})`);
-
+      console.log(`✅ تم الحفظ في Supabase: ${item.title}`);
     } catch (err) {
       console.log(`⚠️ تخطي ${item.title}: ${err.message}`);
     }
@@ -221,7 +233,7 @@ async function run() {
 
   await browser.close();
 
-  // الانتقال إلى الصفحة أو القسم التالي
+  // تحديث المؤشر للصفحة التالية
   let nextIndex = targetIndex;
   let nextPage = page + 1;
   if (items.length === 0 || page >= 30) {
@@ -234,7 +246,7 @@ async function run() {
     body: JSON.stringify({ target_index: nextIndex, current_page: nextPage })
   });
 
-  console.log(`🎉 انتهت الدورة. المحطة التالية: قسم ${nextIndex} صفحة ${nextPage}`);
+  console.log(`🎉 اكتملت الدورة. الانتقال القادم: قسم ${nextIndex} صفحة ${nextPage}`);
 }
 
 run().catch(err => {
