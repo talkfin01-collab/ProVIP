@@ -1,0 +1,34 @@
+name: Auto Scraper Cron
+
+on:
+  schedule:
+    # يعمل تلقائياً كل 30 دقيقة على مدار الساعة
+    - cron: '*/30 * * * *'
+  workflow_dispatch: # يتيح لك تشغيله يدوياً بضغطة زر في أي وقت
+
+jobs:
+  scrape-and-sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: فحص الكود
+        uses: actions/checkout@v4
+
+      - name: إعداد Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: تثبيت التبعيات
+        run: npm ci || npm install
+
+      - name: تثبيت متصفح Chrome لـ Puppeteer
+        run: npx puppeteer browsers install chrome
+
+      - name: تشغيل الكاشط وتحديث Supabase
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: node scraper.js
