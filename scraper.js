@@ -34,49 +34,15 @@ async function db(endpoint, options = {}) {
   return text ? JSON.parse(text) : null;
 }
 
-// دالة تخطي ونقر مربع التحقق الخاص بـ Cloudflare
-async function solveTurnstile(page) {
-  try {
-    const frames = page.frames();
-    for (const frame of frames) {
-      if (frame.url().includes('cloudflare') || frame.url().includes('turnstile')) {
-        const checkbox = await frame.$('input[type="checkbox"], .ctp-checkbox-label, #challenge-stage');
-        if (checkbox) {
-          console.log('👆 تم اكتشاف مربع Turnstile... جاري النقر عليه...');
-          await checkbox.click();
-          await new Promise(r => setTimeout(r, 3000));
-          return true;
-        }
-      }
-    }
-
-    // محاولة ثانية بالنقر على إطار الـ Iframe مباشرة إن لم يتم الوصول لداخله
-    const iframeElement = await page.$('iframe[src*="cloudflare"], iframe[src*="turnstile"]');
-    if (iframeElement) {
-      const rect = await iframeElement.boundingBox();
-      if (rect) {
-        console.log('👆 النقر المباشر على إحداثيات نافذة التحقق...');
-        await page.mouse.click(rect.x + 25, rect.y + 25);
-        await new Promise(r => setTimeout(r, 3000));
-        return true;
-      }
-    }
-  } catch (e) {
-    // تجاهل أخطاء النقر المؤقتة
-  }
-  return false;
-}
-
-// دالة تنقل ذكية تتحقق من فك الحظر
+// دالة تنقل ذكية تنتظر فك حظر Cloudflare
 async function safeNavigate(page, url) {
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
   let title = await page.title();
   let retries = 0;
 
-  while ((title.includes('Just a moment') || title.includes('Cloudflare') || title.includes('Attention Required')) && retries < 12) {
-    console.log(`⏳ فحص Cloudflare قيد الانتظار (محاولة ${retries + 1}/12)...`);
-    await solveTurnstile(page);
-    await new Promise(r => setTimeout(r, 4000));
+  while ((title.includes('Just a moment') || title.includes('Cloudflare') || title.includes('Attention Required')) && retries < 10) {
+    console.log(`⏳ انتظار حل فحص Cloudflare تلقائياً (محاولة ${retries + 1}/10)...`);
+    await new Promise(r => setTimeout(r, 3000));
     title = await page.title();
     retries++;
   }
@@ -84,7 +50,7 @@ async function safeNavigate(page, url) {
 }
 
 async function run() {
-  console.log('🚀 [v5 - Real Headful + Turnstile Auto-Clicker] بدء التشغيل...');
+  console.log('🚀 [v6 - Session Warmup & Unified Browser] بدء التشغيل...');
 
   let state = (await db('scraper_state?id=eq.1&select=*'))?.[0];
   if (!state) {
@@ -101,17 +67,14 @@ async function run() {
     ? (page === 1 ? `${PRIMARY_DOMAIN}/` : `${PRIMARY_DOMAIN}/page/${page}/`)
     : `${PRIMARY_DOMAIN}${target.path}`.replace(/\/+$/, '') + (page === 1 ? '/' : `/page/${page}/`);
 
-  console.log(`🌐 الرابط المستهدف: ${targetUrl} (قسم: ${target.category} | صفحة: ${page})`);
-
-  // تشغيل متصفح حقيقي مرئي داخل xvfb
   const browser = await puppeteer.launch({
-    headless: false,
+    headless: 'new',
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
-      '--window-size=1920,1080',
-      '--disable-blink-features=AutomationControlled'
+      '--disable-blink-features=AutomationControlled',
+      '--window-size=1920,1080'
     ]
   });
 
@@ -119,10 +82,21 @@ async function run() {
   await pageTab.setViewport({ width: 1920, height: 1080 });
   await pageTab.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36');
 
-  const mainTitle = await safeNavigate(pageTab, targetUrl);
-  console.log(`📄 عنوان الصفحة النهائي: "${mainTitle}"`);
+  await pageTab.evaluateOnNewDocument(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+  });
 
-  // استخراج البطاقات
+  // 1. مرحلة تهيئة الجلسة وحصد الكوكيز من الصفحة الرئيسية أولاً
+  console.log('🔑 تهيئة الجلسة والحصول على ترخيص Cloudflare عبر الصفحة الرئيسية...');
+  const rootTitle = await safeNavigate(pageTab, `${PRIMARY_DOMAIN}/`);
+  console.log(`🌐 تم تأكيد الجلسة بنجاح: "${rootTitle}"`);
+
+  // 2. التوجه مباشرة إلى القسم والصفحة المطلوبة
+  console.log(`🎯 الانتقال للهدف: ${targetUrl} (قسم: ${target.category} | صفحة: ${page})`);
+  const targetTitle = await safeNavigate(pageTab, targetUrl);
+  console.log(`📄 عنوان صفحة القسم: "${targetTitle}"`);
+
+  // 3. استخراج عناصر الصفحة
   const rawItems = await pageTab.evaluate(() => {
     const list = [];
     document.querySelectorAll('.Thumb--GridItem').forEach(el => {
@@ -158,12 +132,19 @@ async function run() {
 
   console.log(`📦 العناصر الفريدة المستخرجة: ${items.length} عنصر.`);
 
-  // معالجة العناصر
+  // 4. معالجة عناصر الصفحة واستخراج السيرفرات
   for (const item of items.slice(0, 8)) {
     try {
-      console.log(`🔍 جلب صفحة: ${item.title}`);
+      console.log(`🔍 جلب تفاصيل: ${item.title}`);
       const detailUrl = `${PRIMARY_DOMAIN}${item.path}`;
       await safeNavigate(pageTab, detailUrl);
+
+      // نقر تبويب المشاهدة إن وجد لتفعيل السيرفرات في الـ DOM
+      await pageTab.evaluate(() => {
+        const watchBtn = document.querySelector('.Watch--Btn, .btn--watch, a[href*="#watch"], [data-tab="watch"]');
+        if (watchBtn) watchBtn.click();
+      });
+      await new Promise(r => setTimeout(r, 1500));
 
       const pageData = await pageTab.evaluate(() => {
         const servers = [];
@@ -180,7 +161,7 @@ async function run() {
         selectors.forEach(sel => {
           document.querySelectorAll(sel).forEach(el => {
             const url = el.getAttribute('data-watch') || el.getAttribute('data-url') || el.getAttribute('href');
-            const name = el.innerText.trim() || el.getAttribute('title') || 'سيرفر مشاهدة';
+            const name = el.innerText.trim() || el.getAttribute('title') || 'سيرفر';
             if (url && !url.startsWith('#') && !url.startsWith('javascript:')) {
               servers.push({ name, url });
             }
@@ -233,7 +214,7 @@ async function run() {
 
   await browser.close();
 
-  // تحديث المؤشر للصفحة التالية
+  // تحديث المؤشر للصفحة القادمة
   let nextIndex = targetIndex;
   let nextPage = page + 1;
   if (items.length === 0 || page >= 30) {
