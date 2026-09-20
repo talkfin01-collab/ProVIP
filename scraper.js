@@ -77,7 +77,7 @@ async function solveTurnstileIfPresent(page) {
   return false;
 }
 
-// دالة التنقل الذكية مع دعم المرجع والانتظار التلقائي لحل فحص الحماية
+// دالة التنقل الذكية مع دعم المرجع والانتظار لحل فحص الحماية
 async function safeNavigate(page, url, referer = '') {
   const options = { waitUntil: 'domcontentloaded', timeout: 60000 };
   if (referer) options.referer = referer;
@@ -97,7 +97,7 @@ async function safeNavigate(page, url, referer = '') {
 }
 
 async function run() {
-  console.log('🚀 [v9 - Complete Catalog & Stream Sniffer] بدء التشغيل...');
+  console.log('🚀 [v10 - Full Metadata & Info Extraction] بدء التشغيل...');
 
   let state = (await db('scraper_state?id=eq.1&select=*'))?.[0];
   if (!state) {
@@ -135,12 +135,12 @@ async function run() {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
   });
 
-  // 1. فتح الصفحة الرئيسية لتوثيق الجلسة وحصد الكوكيز الصالحة
+  // 1. فتح الصفحة الرئيسية لتوثيق الجلسة
   console.log('🔑 توثيق الجلسة عبر الصفحة الرئيسية...');
   const rootTitle = await safeNavigate(pageTab, `${PRIMARY_DOMAIN}/`);
   console.log(`🌐 تم تأكيد الجلسة بنجاح: "${rootTitle}"`);
 
-  // 2. التوجه لصفحة القسم المحددة في الدورة
+  // 2. التوجه لصفحة القسم
   console.log(`🎯 فتح صفحة القسم المستهدفة...`);
   const targetTitle = await safeNavigate(pageTab, targetUrl, `${PRIMARY_DOMAIN}/`);
   console.log(`📄 عنوان صفحة القسم: "${targetTitle}"`);
@@ -181,8 +181,8 @@ async function run() {
 
   console.log(`📦 العناصر الفريدة المستخرجة: ${items.length} عنصر.`);
 
-  // 4. معالجة العناصر واصطياد روابط البث المباشر (Direct Stream & Embeds)
-  for (const item of items.slice(0, 8)) {
+  // 4. معالجة العناصر واستخراج البيانات والقصة والتقييم وروابط البث
+  for (const item of items.slice(0, 10)) {
     try {
       console.log(`🔍 بدء فحص: ${item.title}`);
       
@@ -209,11 +209,11 @@ async function run() {
 
       pageTab.on('request', networkSniffer);
 
-      // فتح صفحة العمل مع تمرير Referer موثوق
+      // فتح صفحة العمل مع تمرير Referer
       const detailUrl = `${PRIMARY_DOMAIN}${item.path}`;
       await safeNavigate(pageTab, detailUrl, targetUrl);
 
-      // محاكاة النقر على أول سيرفر أو زر المشاهدة لتفعيل طلب البث في الشبكة
+      // نقر زر المشاهدة لتفعيل المشغل
       await pageTab.evaluate(() => {
         const triggers = [
           'ul#watch li:first-child',
@@ -233,26 +233,93 @@ async function run() {
         }
       });
 
-      // مهلة كافية لإطلاق طلبات الفيديو من المشغل
-      await new Promise(r => setTimeout(r, 2500));
+      await new Promise(r => setTimeout(r, 2200));
 
-      // قراءة الـ DOM المباشر لأي سيرفرات مكتوبة مسبقاً
-      const domServers = await pageTab.evaluate(() => {
-        const list = [];
+      // استخراج تفاصيل العمل (القصة، التقييم، التصنيفات الفرعية، السيرفرات المكتوبة)
+      const pageDetails = await pageTab.evaluate(() => {
+        // 1. القصة (Story)
+        let story = '';
+        const storySelectors = [
+          '.StoryMovieContent',
+          '.Story--Content',
+          '.PostStory',
+          '.single-story',
+          'div.Story',
+          '.Poster--Single-Content p',
+          '[itemprop="description"]'
+        ];
+        for (const s of storySelectors) {
+          const el = document.querySelector(s);
+          if (el && el.innerText.trim()) {
+            story = el.innerText.trim();
+            break;
+          }
+        }
+        if (!story) {
+          const paragraphs = Array.from(document.querySelectorAll('p, div'));
+          for (const p of paragraphs) {
+            if (p.children.length === 0 && (p.innerText.startsWith('قصة') || p.innerText.startsWith('القصة') || p.innerText.includes('تدور أحداث'))) {
+              story = p.innerText.replace(/^(القصة|قصة)\s*[:\-]\s*/, '').trim();
+              break;
+            }
+          }
+        }
+
+        // 2. التقييم (Rating / IMDb)
+        let rating = null;
+        const ratingSelectors = [
+          '.IMDB--Rating',
+          '.Rate--Single',
+          '.imdbRating',
+          '.imdb-rate',
+          '.imdb',
+          '.rating',
+          '[itemprop="ratingValue"]'
+        ];
+        for (const s of ratingSelectors) {
+          const el = document.querySelector(s);
+          if (el && el.innerText.trim()) {
+            const match = el.innerText.match(/(\d+(\.\d+)?)/);
+            if (match) {
+              rating = parseFloat(match[1]);
+              break;
+            }
+          }
+        }
+        if (!rating) {
+          const bodyText = document.body ? document.body.innerText : '';
+          const ratingMatch = bodyText.match(/IMDb\s*[:\s]?\s*(\d+(\.\d+)?)/i) || bodyText.match(/(\d+\.\d+)\s*\/\s*10/);
+          if (ratingMatch) {
+            rating = parseFloat(ratingMatch[1]);
+          }
+        }
+
+        // 3. التصنيفات الفرعية (Genres)
+        const genres = [];
+        document.querySelectorAll('a[href*="/genre/"], .Terms--List li a').forEach(a => {
+          const txt = a.innerText.trim();
+          if (txt && !txt.includes('ماي سيما') && !txt.includes('وي سيما') && !genres.includes(txt)) {
+            genres.push(txt);
+          }
+        });
+
+        // 4. السيرفرات المكتوبة في الـ DOM
+        const domServers = [];
         document.querySelectorAll('ul#watch li, ul.WatchServersList li, [data-watch], [data-url]').forEach(li => {
           const url = li.getAttribute('data-watch') || li.getAttribute('data-url');
           const name = li.innerText.trim() || 'سيرفر مشاهدة';
           if (url && !url.startsWith('#') && !url.startsWith('javascript:')) {
-            list.push({ name, url });
+            domServers.push({ name, url });
           }
         });
-        return list;
+
+        return { story, rating, genres, domServers };
       });
 
       pageTab.off('request', networkSniffer);
 
-      // تجميع كافة السيرفرات المكتشفة مع إعطاء الأولوية للرابط المباشر
-      const allServers = [...capturedEmbeds, ...domServers];
+      // دمج وتصفية السيرفرات
+      const allServers = [...capturedEmbeds, ...pageDetails.domServers];
       if (directPlayUrl) {
         allServers.unshift({ name: 'بث مباشر رئيسي (Direct)', url: directPlayUrl });
       }
@@ -266,13 +333,13 @@ async function run() {
         }
       }
 
-      console.log(`📡 إجمالي السيرفرات المكتشفة لـ (${item.title}): ${finalServers.length}`);
+      console.log(`📊 تفاصيل (${item.title}): تقييم: ${pageDetails.rating || 'N/A'} | تصنيفات: [${pageDetails.genres.join(', ')}] | طول القصة: ${pageDetails.story ? pageDetails.story.length : 0} حرف`);
+      console.log(`📡 إجمالي السيرفرات المكتشفة: ${finalServers.length}`);
 
-      // تحديد رابط البث الأساسي
       const primaryStreamUrl = directPlayUrl || finalServers[0]?.url || detailUrl;
       const contentType = target.type === 'series' || item.isSeries ? 'series' : target.type;
 
-      // حفظ أو تحديث السجل في Supabase
+      // حفظ السجل كاملاً في Supabase
       await db('contents?on_conflict=page_url', {
         method: 'POST',
         headers: { 'Prefer': 'resolution=merge-duplicates' },
@@ -284,12 +351,18 @@ async function run() {
           poster_url: item.poster,
           stream_url: primaryStreamUrl,
           page_url: item.path,
-          extra_data: { servers: finalServers, direct_stream: directPlayUrl || null },
+          extra_data: {
+            servers: finalServers,
+            direct_stream: directPlayUrl || null,
+            story: pageDetails.story || null,
+            rating: pageDetails.rating || null,
+            genres: pageDetails.genres || []
+          },
           updated_at: new Date().toISOString()
         }])
       });
 
-      console.log(`✅ تم الحفظ في Supabase: ${item.title}`);
+      console.log(`✅ تم الحفظ بالبيانات الكاملة في Supabase: ${item.title}`);
 
     } catch (err) {
       console.log(`⚠️ تخطي ${item.title}: ${err.message}`);
