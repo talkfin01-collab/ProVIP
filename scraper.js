@@ -30,7 +30,7 @@ const CATEGORY_ORDER = [
   { path: '/category/%d9%85%d8%b3%d9%84%d8%b3%d9%84%d8%a7%d8%aa-%d9%87%d9%86%d8%af%d9%8a%d8%a9/', category: 'series_indian', type: 'series' },
   { path: '/category/%d9%85%d8%b3%d9%84%d8%b3%d9%84%d8%a7%d8%aa-%d8%a7%d9%86%d9%85%d9%8a/', category: 'series_anime', type: 'series' },
   { path: '/category/%d9%85%d8%b3%d9%84%d8%b3%d9%84%d8%a7%d8%aa-%d9%85%d8%af%d8%a8%d9%84%d8%ac%d8%a9/', category: 'series_dubbed', type: 'series' },
-  { path: '/category/%d8%a8%d8%b1%d8%a7%d9%85%d8%ac-%d8%aa%d9%84%d9%81%d8%b2%d9%8a%d9%88%d9%86%d9%8a%d8%a9/', category: 'tv_shows', type: 'series' },
+  { path: '/category/%d8%a8%d8%b1%d8%a7%d9%85%d8%ac-%d8%aa%d9%84%d9%81%d8%b2%d9%8a%d9%86%d9%8a%d8%a9/', category: 'tv_shows', type: 'series' },
   { path: '/category/%d8%b9%d8%b1%d9%88%d8%b6-%d9%85%d8%b5%d8%a7%d8%b1%d8%b9%d8%a9/', category: 'wrestling', type: 'wrestling' },
   { path: '/category/%d9%85%d8%b3%d8%b1%d8%ad%d9%8a%d8%a7%d8%aa-%d8%b9%d8%b1%d8%a8%d9%8a%d8%a9/', category: 'theater', type: 'theater' }
 ];
@@ -83,7 +83,7 @@ async function solveTurnstileIfPresent(page) {
   return false;
 }
 
-// دالة تنقل آمنة تدعم التحقق والترويسة المرجعية
+// دالة تنقل آمنة
 async function safeNavigate(page, url, referer = '') {
   const options = { waitUntil: 'domcontentloaded', timeout: 60000 };
   if (referer) options.referer = referer;
@@ -103,7 +103,7 @@ async function safeNavigate(page, url, referer = '') {
 }
 
 async function run() {
-  console.log('🚀 [v13 - Full Deep Metadata & Resilient Scraper] بدء التشغيل...');
+  console.log('🚀 [v14 - Accurate Content & Targeted Taxonomies] بدء التشغيل...');
 
   let state = (await db('scraper_state?id=eq.1&select=*'))?.[0];
   if (!state) {
@@ -137,7 +137,7 @@ async function run() {
   await pageTab.setViewport({ width: 1920, height: 1080 });
   await pageTab.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36');
 
-  // تحييد النوافذ المنبثقة والإعلانات إجبارياً من الجذور
+  // تحييد النوافذ المنبثقة من الجذور
   await pageTab.evaluateOnNewDocument(() => {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     window.open = function () { return null; };
@@ -150,7 +150,6 @@ async function run() {
   const capturedEmbeds = [];
   const seenUrls = new Set();
 
-  // تتبع حركة الشبكة لاصطياد روابط الفيديو والبث المباشر
   pageTab.on('request', (req) => {
     const u = req.url();
     if (u.includes('govid.live/video-') || u.includes('govid.live/play/') || u.includes('.m3u8') || u.includes('.mp4')) {
@@ -213,7 +212,7 @@ async function run() {
 
   console.log(`📦 العناصر الفريدة المستخرجة: ${items.length} عنصر.`);
 
-  // 4. معالجة العناصر واستخراج البيانات وروابط البث
+  // 4. معالجة العناصر بدقة
   for (const item of items.slice(0, 10)) {
     try {
       console.log(`🔍 بدء فحص: ${item.title}`);
@@ -246,24 +245,40 @@ async function run() {
 
       await new Promise(r => setTimeout(r, 2200));
 
-      // استخراج القصة بدقة وسوم الـ SEO والميتا والتقييم والأنواع
+      // استخراج القصة والتقييم والتصنيفات بدقة واستبعاد أشرطة التنقل العامة
       const pageDetails = await pageTab.evaluate(() => {
-        // 1. القصة (Story) - من وسوم الميتا الرسمية أو الوصف الداخلي
+        // حصر الاستخراج داخل صندوق العمل الرئيسي
+        const mainContent = document.querySelector('.Poster--Single-Content, .single-content, .Post--Content, .StoryMovieContent') || document.body;
+
+        // 1. القصة (Story): استخراج النص الفعلي المكتوب في الصفحة
         let story = '';
-        const metaDesc = document.querySelector('meta[property="og:description"], meta[name="description"]');
-        if (metaDesc && metaDesc.content) {
-          story = metaDesc.content.trim();
-        }
+        const storySelectors = [
+          '.StoryMovieContent',
+          '.Story--Content',
+          '.PostStory',
+          '.single-story',
+          '.Story'
+        ];
         
-        if (!story || story.length < 15) {
-          const storyEl = document.querySelector('.StoryMovieContent, .Story--Content, .PostStory, .single-story, [itemprop="description"]');
-          if (storyEl && storyEl.innerText.trim()) {
-            story = storyEl.innerText.trim();
+        for (const sel of storySelectors) {
+          const el = document.querySelector(sel);
+          if (el && el.innerText.trim()) {
+            story = el.innerText.trim();
+            break;
           }
         }
 
-        // تنظيف القصة من العبارات الترويجية الثابتة
-        story = story.replace(/^(مشاهدة|تحميل)\s+(فيلم|مسلسل).*?(اون لاين|مترجم|مدبلج)\s*[:\-]?\s*/i, '').trim();
+        // إذا لم نجدها في الكلاسات المحددة، نبحث عن الفقرة التي تصف القصة
+        if (!story) {
+          const allPs = Array.from(document.querySelectorAll('.Poster--Single-Content p, .single-content p, p'));
+          for (const p of allPs) {
+            const txt = p.innerText.trim();
+            if (txt.length > 25 && !txt.includes('حقوق') && !txt.includes('ماي سيما') && (txt.includes('تدور') || txt.includes('قصة') || txt.includes('في إطار') || txt.includes('أحداث'))) {
+              story = txt;
+              break;
+            }
+          }
+        }
 
         // 2. التقييم (Rating)
         let rating = null;
@@ -272,25 +287,18 @@ async function run() {
           const match = rateEl.innerText.match(/(\d+(\.\d+)?)/);
           if (match) rating = parseFloat(match[1]);
         }
-        if (!rating) {
-          const bodyText = document.body ? document.body.innerText : '';
-          const match = bodyText.match(/IMDb\s*[:\s]?\s*(\d+(\.\d+)?)/i) || bodyText.match(/(\d\.\d)\s*\/\s*10/);
-          if (match) rating = parseFloat(match[1]);
-        }
 
-        // 3. التصنيفات الفرعية (Genres)
+        // 3. التصنيفات الخاصة بالعمل فقط (تجنب قوائم الـ Navbar)
         const genres = [];
-        document.querySelectorAll('a[href*="/genre/"], a[href*="/category/"]').forEach(a => {
+        // البحث فقط داخل وسوم /genre/ أو قائمة الوسوم الخاصة بالمنشور .Terms--List
+        document.querySelectorAll('a[href*="/genre/"], .Terms--List li a, .taxonomies a').forEach(a => {
           const txt = a.innerText.trim();
           const href = a.getAttribute('href') || '';
           if (
-            txt && 
-            !txt.includes('ماي سيما') && 
-            !txt.includes('وي سيما') && 
-            !txt.includes('افلام') && 
-            !txt.includes('مسلسلات') && 
-            !txt.includes('الرئيسية') &&
-            !href.includes('/page/') &&
+            txt &&
+            !href.includes('/category/') && // استبعاد التصنيفات العامة لتفادي شريط الموقع
+            !txt.includes('ماي سيما') &&
+            !txt.includes('وي سيما') &&
             !genres.includes(txt)
           ) {
             genres.push(txt);
