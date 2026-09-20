@@ -35,7 +35,7 @@ async function db(endpoint, options = {}) {
 }
 
 async function run() {
-  console.log('🚀 [النسخة المحدثة v2] بدء تشغيل الكاشط...');
+  console.log('🚀 [v3 - حفظ مباشر وفحص السيرفرات] بدء التشغيل...');
 
   let state = (await db('scraper_state?id=eq.1&select=*'))?.[0];
   if (!state) {
@@ -69,33 +69,27 @@ async function run() {
   await pageTab.setViewport({ width: 1920, height: 1080 });
   await pageTab.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36');
 
-  // تعطيل كشف المتصفح الآلي
   await pageTab.evaluateOnNewDocument(() => {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
   });
 
   await pageTab.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-  // مراقبة فحص Cloudflare
   let title = await pageTab.title();
-  console.log(`📄 عنوان الصفحة المبدئي: "${title}"`);
-
   let retries = 0;
   while ((title.includes('Just a moment') || title.includes('Cloudflare') || title.includes('Attention Required')) && retries < 8) {
-    console.log(`⏳ جاري انتظار حل Cloudflare... (محاولة ${retries + 1}/8)`);
+    console.log(`⏳ جاري تخطي Cloudflare... (محاولة ${retries + 1}/8)`);
     await new Promise(r => setTimeout(r, 4000));
     title = await pageTab.title();
   }
 
-  console.log(`✅ عنوان الصفحة النهائي: "${title}"`);
-
-  // استخراج المحتوى
-  const items = await pageTab.evaluate(() => {
+  // استخراج البطاقات بدون تكرار
+  const rawItems = await pageTab.evaluate(() => {
     const list = [];
-    const elements = document.querySelectorAll('.Thumb--GridItem, .GridItem, a[href*="/watch/"], a[href*="/post/"]');
+    const elements = document.querySelectorAll('.Thumb--GridItem');
 
     elements.forEach(el => {
-      const linkEl = el.tagName.toLowerCase() === 'a' ? el : el.querySelector('a');
+      const linkEl = el.querySelector('a');
       if (!linkEl) return;
       const rawHref = linkEl.getAttribute('href') || '';
       const path = rawHref.replace(/^https?:\/\/[^\/]+/, '');
@@ -119,62 +113,89 @@ async function run() {
     return list;
   });
 
-  console.log(`📦 النتيجة: تم العثور على ${items.length} عنصر.`);
+  // تصفية العناصر المكررة حسب المسار (path)
+  const uniqueMap = new Map();
+  for (const it of rawItems) {
+    if (!uniqueMap.has(it.path)) uniqueMap.set(it.path, it);
+  }
+  const items = Array.from(uniqueMap.values());
 
-  if (items.length === 0) {
-    // طباعة تشخيصية في حال بقي 0 عناصر
-    const bodyText = await pageTab.evaluate(() => document.body?.innerText?.slice(0, 300) || 'فارغ');
-    console.log(`🔍 مقتطف من محتوى الصفحة:\n${bodyText}`);
-  } else {
-    // حفظ أول 5 عناصر في قاعدة البيانات للتجربة
-    for (const item of items.slice(0, 5)) {
-      try {
-        console.log(`🔍 فحص تفاصيل: ${item.title}`);
-        const detailTab = await browser.newPage();
-        await detailTab.goto(`${PRIMARY_DOMAIN}${item.path}`, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        await new Promise(r => setTimeout(r, 2000));
+  console.log(`📦 العناصر الفريدة المستخرجة: ${items.length} عنصر.`);
 
-        const servers = await detailTab.evaluate(() => {
-          const s = [];
-          document.querySelectorAll('ul#watch li, ul.WatchServersList li').forEach(li => {
-            const url = li.getAttribute('data-watch') || li.getAttribute('data-url');
-            if (url) s.push({ name: li.innerText.trim() || 'Server', url });
-          });
-          return s;
+  // معالجة أول 10 عناصر
+  for (const item of items.slice(0, 10)) {
+    try {
+      console.log(`🔍 جلب صفحة: ${item.title}`);
+      const detailTab = await browser.newPage();
+      await detailTab.goto(`${PRIMARY_DOMAIN}${item.path}`, { waitUntil: 'domcontentloaded', timeout: 35000 });
+      await new Promise(r => setTimeout(r, 2500));
+
+      const pageData = await detailTab.evaluate(() => {
+        const servers = [];
+        
+        // 1. فحص قوائم المشاهدة المعتادة
+        document.querySelectorAll('ul#watch li, ul.WatchServersList li, .servers--list li').forEach(li => {
+          const url = li.getAttribute('data-watch') || li.getAttribute('data-url') || li.querySelector('a')?.getAttribute('href');
+          const name = li.innerText.trim() || 'سيرفر';
+          if (url && !url.startsWith('#')) servers.push({ name, url });
         });
 
-        await detailTab.close();
-
-        if (servers.length > 0) {
-          await db('contents?on_conflict=page_url', {
-            method: 'POST',
-            headers: { 'Prefer': 'resolution=merge-duplicates' },
-            body: JSON.stringify([{
-              title: item.title,
-              type: item.isSeries ? 'series' : 'movie',
-              category: target.category,
-              year: item.year,
-              poster_url: item.poster,
-              stream_url: servers[0].url,
-              page_url: item.path,
-              extra_data: { servers },
-              updated_at: new Date().toISOString()
-            }])
+        // 2. فحص أزرار المشاهدة المباشرة
+        if (servers.length === 0) {
+          document.querySelectorAll('a.btn--watch, a[href*="/watch/"]').forEach(a => {
+            const url = a.getAttribute('href');
+            if (url) servers.push({ name: 'مشاهدة مباشرة', url });
           });
-          console.log(`✅ تم الحفظ بنجاح: ${item.title}`);
         }
-      } catch (err) {
-        console.log(`⚠️ خطأ في معالجة ${item.title}: ${err.message}`);
+
+        // 3. استخراج أسماء الأزرار المتاحة في حال عدم وجود سيرفرات لتشخيص الهيكل
+        const sampleButtons = Array.from(document.querySelectorAll('a, button, ul li'))
+          .map(e => e.innerText.trim())
+          .filter(t => t.includes('سيرفر') || t.includes('مشاهدة') || t.includes('تحميل'))
+          .slice(0, 5);
+
+        return { servers, sampleButtons };
+      });
+
+      await detailTab.close();
+
+      console.log(`📡 عدد السيرفرات المكتشفة لـ (${item.title}): ${pageData.servers.length}`);
+      if (pageData.servers.length === 0 && pageData.sampleButtons.length > 0) {
+        console.log(`ℹ️ أزرار المشاهدة المتوفرة في الصفحة: ${pageData.sampleButtons.join(' | ')}`);
       }
+
+      // حفظ المحتوى في Supabase
+      const primaryStreamUrl = pageData.servers[0]?.url || `${PRIMARY_DOMAIN}${item.path}`;
+      
+      await db('contents?on_conflict=page_url', {
+        method: 'POST',
+        headers: { 'Prefer': 'resolution=merge-duplicates' },
+        body: JSON.stringify([{
+          title: item.title,
+          type: item.isSeries ? 'series' : 'movie',
+          category: target.category,
+          year: item.year,
+          poster_url: item.poster,
+          stream_url: primaryStreamUrl,
+          page_url: item.path,
+          extra_data: { servers: pageData.servers },
+          updated_at: new Date().toISOString()
+        }])
+      });
+
+      console.log(`✅ تم الحفظ في قاعدة البيانات: ${item.title}`);
+
+    } catch (err) {
+      console.log(`⚠️ تخطي ${item.title}: ${err.message}`);
     }
   }
 
   await browser.close();
 
-  // تحديث الصفحة للمرة القادمة
+  // الانتقال للصفحة التالية
   let nextIndex = targetIndex;
   let nextPage = page + 1;
-  if (items.length === 0 || page >= 20) {
+  if (items.length === 0 || page >= 30) {
     nextPage = 1;
     nextIndex = (targetIndex + 1) % CATEGORY_ORDER.length;
   }
@@ -184,7 +205,7 @@ async function run() {
     body: JSON.stringify({ target_index: nextIndex, current_page: nextPage })
   });
 
-  console.log(`🎉 انتهت الدورة. المحطة التالية: القسم ${nextIndex} الصفحة ${nextPage}`);
+  console.log(`🎉 اكتملت الدورة. الانتقال القادم: قسم ${nextIndex} صفحة ${nextPage}`);
 }
 
 run().catch(err => {
