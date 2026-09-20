@@ -34,14 +34,14 @@ async function db(endpoint, options = {}) {
   return text ? JSON.parse(text) : null;
 }
 
-// دالة تنقل ذكية تنتظر فك حظر Cloudflare
+// دالة تنقل ذكية تتحقق من تخطي شاشة الانتظار
 async function safeNavigate(page, url) {
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
   let title = await page.title();
   let retries = 0;
 
   while ((title.includes('Just a moment') || title.includes('Cloudflare') || title.includes('Attention Required')) && retries < 10) {
-    console.log(`⏳ انتظار حل فحص Cloudflare تلقائياً (محاولة ${retries + 1}/10)...`);
+    console.log(`⏳ فحص Cloudflare نشط... انتظار الحل (محاولة ${retries + 1}/10)...`);
     await new Promise(r => setTimeout(r, 3000));
     title = await page.title();
     retries++;
@@ -50,7 +50,7 @@ async function safeNavigate(page, url) {
 }
 
 async function run() {
-  console.log('🚀 [v6 - Session Warmup & Unified Browser] بدء التشغيل...');
+  console.log('🚀 [v7 - In-Browser Fetching & Parser] بدء التشغيل...');
 
   let state = (await db('scraper_state?id=eq.1&select=*'))?.[0];
   if (!state) {
@@ -86,25 +86,30 @@ async function run() {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
   });
 
-  // 1. مرحلة تهيئة الجلسة وحصد الكوكيز من الصفحة الرئيسية أولاً
-  console.log('🔑 تهيئة الجلسة والحصول على ترخيص Cloudflare عبر الصفحة الرئيسية...');
+  // 1. فتح الصفحة الرئيسية لتوثيق الجلسة وحصد التراخيص
+  console.log('🔑 توثيق الجلسة عبر الصفحة الرئيسية...');
   const rootTitle = await safeNavigate(pageTab, `${PRIMARY_DOMAIN}/`);
   console.log(`🌐 تم تأكيد الجلسة بنجاح: "${rootTitle}"`);
 
-  // 2. التوجه مباشرة إلى القسم والصفحة المطلوبة
-  console.log(`🎯 الانتقال للهدف: ${targetUrl} (قسم: ${target.category} | صفحة: ${page})`);
+  // 2. الانتقال إلى صفحة القسم المستهدفة
+  console.log(`🎯 التوجه إلى: ${targetUrl} (قسم: ${target.category} | صفحة: ${page})`);
   const targetTitle = await safeNavigate(pageTab, targetUrl);
   console.log(`📄 عنوان صفحة القسم: "${targetTitle}"`);
 
-  // 3. استخراج عناصر الصفحة
-  const rawItems = await pageTab.evaluate(() => {
+  // 3. استخراج الروابط وبيانات البطاقات مباشرة من الصفحة المفتوحة
+  const items = await pageTab.evaluate(() => {
     const list = [];
-    document.querySelectorAll('.Thumb--GridItem').forEach(el => {
+    const seen = new Set();
+    const elements = document.querySelectorAll('.Thumb--GridItem');
+
+    elements.forEach(el => {
       const linkEl = el.querySelector('a');
       if (!linkEl) return;
       const rawHref = linkEl.getAttribute('href') || '';
       const path = rawHref.replace(/^https?:\/\/[^\/]+/, '');
-      if (!path || path.startsWith('/category/') || path.startsWith('/tag/') || path === '/') return;
+      if (!path || path.startsWith('/category/') || path.startsWith('/tag/') || path === '/' || seen.has(path)) return;
+
+      seen.add(path);
 
       const titleEl = el.querySelector('strong, .title, h2');
       const title = titleEl ? titleEl.innerText.trim() : (linkEl.getAttribute('title') || '');
@@ -124,72 +129,63 @@ async function run() {
     return list;
   });
 
-  const uniqueMap = new Map();
-  for (const it of rawItems) {
-    if (!uniqueMap.has(it.path)) uniqueMap.set(it.path, it);
-  }
-  const items = Array.from(uniqueMap.values());
-
   console.log(`📦 العناصر الفريدة المستخرجة: ${items.length} عنصر.`);
 
-  // 4. معالجة عناصر الصفحة واستخراج السيرفرات
-  for (const item of items.slice(0, 8)) {
+  // 4. جلب سيرفرات المشاهدة عبر Fetch داخلي من داخل نافذة المتصفح نفسها
+  for (const item of items.slice(0, 15)) {
     try {
-      console.log(`🔍 جلب تفاصيل: ${item.title}`);
-      const detailUrl = `${PRIMARY_DOMAIN}${item.path}`;
-      await safeNavigate(pageTab, detailUrl);
+      console.log(`🔍 جلب سيرفرات: ${item.title}`);
 
-      // نقر تبويب المشاهدة إن وجد لتفعيل السيرفرات في الـ DOM
-      await pageTab.evaluate(() => {
-        const watchBtn = document.querySelector('.Watch--Btn, .btn--watch, a[href*="#watch"], [data-tab="watch"]');
-        if (watchBtn) watchBtn.click();
-      });
-      await new Promise(r => setTimeout(r, 1500));
+      const pageData = await pageTab.evaluate(async (itemPath) => {
+        try {
+          const res = await fetch(itemPath, {
+            headers: {
+              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+            }
+          });
 
-      const pageData = await pageTab.evaluate(() => {
-        const servers = [];
-        const selectors = [
-          'ul#watch li',
-          'ul.WatchServersList li',
-          '.servers--list li',
-          '.Watch--Servers--List li',
-          'ul.List--Download--Wecima--Single li a',
-          '[data-watch]',
-          '[data-url]'
-        ];
+          if (!res.ok) return { servers: [], error: `HTTP ${res.status}` };
+          const htmlText = await res.text();
 
-        selectors.forEach(sel => {
-          document.querySelectorAll(sel).forEach(el => {
-            const url = el.getAttribute('data-watch') || el.getAttribute('data-url') || el.getAttribute('href');
-            const name = el.innerText.trim() || el.getAttribute('title') || 'سيرفر';
-            if (url && !url.startsWith('#') && !url.startsWith('javascript:')) {
+          // تحليل الـ HTML باستخدام المتصفح مباشرة
+          const parser = new DOMParser();
+          const doc = parser.parseFromString(htmlText, 'text/html');
+          const servers = [];
+          const seenUrls = new Set();
+
+          // قراءة السيرفرات من ul#watch li وقوائم المشاهدة
+          doc.querySelectorAll('ul#watch li, ul.WatchServersList li, .servers--list li, [data-watch]').forEach(li => {
+            const url = li.getAttribute('data-watch') || li.getAttribute('data-url');
+            const name = li.innerText.trim() || 'سيرفر مشاهدة';
+            if (url && !url.startsWith('#') && !seenUrls.has(url)) {
+              seenUrls.add(url);
               servers.push({ name, url });
             }
           });
-        });
 
-        document.querySelectorAll('iframe').forEach(iframe => {
-          const src = iframe.getAttribute('src') || iframe.getAttribute('data-src');
-          if (src && !src.includes('google') && !src.includes('ad')) {
-            servers.push({ name: 'مشغل مدمج', url: src });
-          }
-        });
+          // قراءة أي مشغل مدمج Iframe
+          doc.querySelectorAll('iframe').forEach(ifr => {
+            const src = ifr.getAttribute('src') || ifr.getAttribute('data-src');
+            if (src && !src.includes('google') && !src.includes('ad') && !seenUrls.has(src)) {
+              seenUrls.add(src);
+              servers.push({ name: 'مشغل مدمج', url: src });
+            }
+          });
 
-        return { servers };
-      });
-
-      const uniqueServers = [];
-      const seenUrls = new Set();
-      for (const s of pageData.servers) {
-        if (!seenUrls.has(s.url)) {
-          seenUrls.add(s.url);
-          uniqueServers.push(s);
+          return { servers, error: null };
+        } catch (e) {
+          return { servers: [], error: e.message };
         }
+      }, item.path);
+
+      if (pageData.error) {
+        console.log(`⚠️ تنبيه أثناء الجلب: ${pageData.error}`);
       }
 
-      console.log(`📡 عدد السيرفرات لـ (${item.title}): ${uniqueServers.length}`);
-      const primaryStreamUrl = uniqueServers[0]?.url || detailUrl;
+      console.log(`📡 عدد السيرفرات لـ (${item.title}): ${pageData.servers.length}`);
+      const primaryStreamUrl = pageData.servers[0]?.url || `${PRIMARY_DOMAIN}${item.path}`;
 
+      // 5. حفظ أو تحديث السجل في Supabase
       await db('contents?on_conflict=page_url', {
         method: 'POST',
         headers: { 'Prefer': 'resolution=merge-duplicates' },
@@ -201,12 +197,16 @@ async function run() {
           poster_url: item.poster,
           stream_url: primaryStreamUrl,
           page_url: item.path,
-          extra_data: { servers: uniqueServers },
+          extra_data: { servers: pageData.servers },
           updated_at: new Date().toISOString()
         }])
       });
 
       console.log(`✅ تم الحفظ في Supabase: ${item.title}`);
+
+      // مهلة نصف ثانية بين كل طلب للحفاظ على استقرار الخادم
+      await new Promise(r => setTimeout(r, 600));
+
     } catch (err) {
       console.log(`⚠️ تخطي ${item.title}: ${err.message}`);
     }
@@ -214,7 +214,7 @@ async function run() {
 
   await browser.close();
 
-  // تحديث المؤشر للصفحة القادمة
+  // تحديث الصفحة للمرة القادمة
   let nextIndex = targetIndex;
   let nextPage = page + 1;
   if (items.length === 0 || page >= 30) {
@@ -227,7 +227,7 @@ async function run() {
     body: JSON.stringify({ target_index: nextIndex, current_page: nextPage })
   });
 
-  console.log(`🎉 اكتملت الدورة. الانتقال القادم: قسم ${nextIndex} صفحة ${nextPage}`);
+  console.log(`🎉 اكتملت الدورة بنجاح. المحطة القادمة: قسم ${nextIndex} صفحة ${nextPage}`);
 }
 
 run().catch(err => {
