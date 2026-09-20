@@ -3,6 +3,12 @@ const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 
 puppeteer.use(StealthPlugin());
 
+// درع حماية لمنع انهيار السكربت عند إغلاق صفحات الإعلانات المفاجئ
+process.on('unhandledRejection', (reason) => {
+  if (reason && reason.message && reason.message.includes('Target closed')) return;
+  console.log('⚠️ [تحذير تم احتواؤه]:', reason?.message || reason);
+});
+
 const PRIMARY_DOMAIN = 'https://mycima.bike';
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://zgxxpdmahcupysrgrhwt.supabase.co';
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
@@ -47,7 +53,7 @@ async function db(endpoint, options = {}) {
   return text ? JSON.parse(text) : null;
 }
 
-// دالة تخطي مربع التحقق
+// دالة تخطي فحص Turnstile
 async function solveTurnstileIfPresent(page) {
   try {
     const frames = page.frames();
@@ -96,7 +102,7 @@ async function safeNavigate(page, url, referer = '') {
 }
 
 async function run() {
-  console.log('🚀 [v11 - Anti-AdHijack & Accurate Metadata] بدء التشغيل...');
+  console.log('🚀 [v12 - Popunder Neutralizer & Resilient Scraper] بدء التشغيل...');
 
   let state = (await db('scraper_state?id=eq.1&select=*'))?.[0];
   if (!state) {
@@ -126,46 +132,26 @@ async function run() {
     ]
   });
 
-  // إغلاق أي نافذة إعلانية منبثقة يفتحها الموقع تلقائياً
-  browser.on('targetcreated', async (t) => {
-    if (t.type() === 'page') {
-      try {
-        const popupPage = await t.page();
-        if (popupPage && popupPage !== pageTab) {
-          await popupPage.close();
-        }
-      } catch (e) {}
-    }
-  });
-
   const pageTab = await browser.newPage();
   await pageTab.setViewport({ width: 1920, height: 1080 });
   await pageTab.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36');
 
-  // تعطيل حظر مغادرة الصفحة
+  // تعطيل النوافذ الإعلانية المنبثقة تماماً قبل تحميل أي صفحة
   await pageTab.evaluateOnNewDocument(() => {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    window.onbeforeunload = null;
+    window.open = function () { return null; };
+    window.alert = function () {};
+    window.confirm = function () { return true; };
+    window.prompt = function () { return null; };
   });
-
-  // تفعيل اعتراض الطلبات لحظر الإعلانات التي تسبب انهيار التبويب
-  await pageTab.setRequestInterception(true);
-  const adDomains = ['politicallygreek.com', 'al5sm.com', 'palybestar.com', 'popads', 'adsterra'];
 
   let directPlayUrl = '';
   const capturedEmbeds = [];
   const seenUrls = new Set();
 
+  // لاقط حركة الشبكة لاصطياد روابط الفيديو فقط وبدون تعطيل تدفق الصفحة
   pageTab.on('request', (req) => {
     const u = req.url();
-
-    // حظر نطاقات الإعلانات المزعجة
-    if (adDomains.some(ad => u.includes(ad))) {
-      req.abort();
-      return;
-    }
-
-    // اصطياد روابط الفيديو المباشرة
     if (u.includes('govid.live/video-') || u.includes('govid.live/play/') || u.includes('.m3u8') || u.includes('.mp4')) {
       if (!directPlayUrl) {
         directPlayUrl = u;
@@ -178,8 +164,6 @@ async function run() {
         console.log(`🎯 [لاقط التضمين]: ${u}`);
       }
     }
-
-    req.continue();
   });
 
   // 1. فتح الصفحة الرئيسية لتوثيق الجلسة
@@ -187,12 +171,12 @@ async function run() {
   const rootTitle = await safeNavigate(pageTab, `${PRIMARY_DOMAIN}/`);
   console.log(`🌐 تم تأكيد الجلسة بنجاح: "${rootTitle}"`);
 
-  // 2. فتح صفحة القسم
+  // 2. فتح صفحة القسم المستهدفة
   console.log(`🎯 فتح صفحة القسم المستهدفة...`);
   const targetTitle = await safeNavigate(pageTab, targetUrl, `${PRIMARY_DOMAIN}/`);
   console.log(`📄 عنوان صفحة القسم: "${targetTitle}"`);
 
-  // 3. استخراج كروت الأعمال
+  // 3. استخراج كروت الأعمال من الـ Grid
   const rawItems = await pageTab.evaluate(() => {
     const list = [];
     document.querySelectorAll('.Thumb--GridItem').forEach(el => {
@@ -228,7 +212,7 @@ async function run() {
 
   console.log(`📦 العناصر الفريدة المستخرجة: ${items.length} عنصر.`);
 
-  // 4. معالجة العناصر
+  // 4. معالجة العناصر بدقة
   for (const item of items.slice(0, 10)) {
     try {
       console.log(`🔍 بدء فحص: ${item.title}`);
@@ -240,7 +224,7 @@ async function run() {
       const detailUrl = `${PRIMARY_DOMAIN}${item.path}`;
       await safeNavigate(pageTab, detailUrl, targetUrl);
 
-      // نقر زر السيرفرات لتفعيل البث المباشر
+      // نقر زر المشغل لتفعيل البث مع تفادي التحويل الإجباري
       await pageTab.evaluate(() => {
         const triggers = [
           'ul#watch li:first-child',
@@ -261,12 +245,12 @@ async function run() {
 
       await new Promise(r => setTimeout(r, 2200));
 
-      // استخراج القصة والتقييم مع عزل القوائم الجانبية تماماً
+      // استخراج القصة والتقييم مع حظر محتوى القوائم الجانبية
       const pageDetails = await pageTab.evaluate(() => {
         // حصر الاستخراج داخل الحاوية المركزية للعمل واستبعاد الأشرطة الجانبية
         const mainScope = document.querySelector('singlesections, singlecontainer, main, .Grid--WecimaPosts') || document.body;
 
-        // 1. القصة
+        // 1. القصة (Story)
         let story = '';
         const storySelectors = [
           '.StoryMovieContent',
@@ -283,7 +267,7 @@ async function run() {
           }
         }
 
-        // 2. التقييم
+        // 2. التقييم (Rating)
         let rating = null;
         const rateEl = mainScope.querySelector('.IMDB--Rating, .Rate--Single, [itemprop="ratingValue"], .imdb');
         if (rateEl) {
@@ -291,7 +275,7 @@ async function run() {
           if (match) rating = parseFloat(match[1]);
         }
 
-        // 3. التصنيفات
+        // 3. التصنيفات الفرعية (Genres)
         const genres = [];
         mainScope.querySelectorAll('a[href*="/genre/"], .Terms--List li a').forEach(a => {
           const txt = a.innerText.trim();
@@ -313,7 +297,7 @@ async function run() {
         return { story, rating, genres, domServers };
       });
 
-      // دمج السيرفرات وترتيبها
+      // دمج وتصفية السيرفرات
       const allServers = [...capturedEmbeds, ...pageDetails.domServers];
       if (directPlayUrl) {
         allServers.unshift({ name: 'بث مباشر رئيسي (Direct)', url: directPlayUrl });
@@ -366,7 +350,7 @@ async function run() {
 
   await browser.close();
 
-  // تحديث المؤشر للدورة القادمة
+  // تحديث مؤشر الدورة القادمة
   let nextIndex = targetIndex;
   let nextPage = page + 1;
   if (items.length === 0 || page >= 30) {
