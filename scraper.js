@@ -115,7 +115,7 @@ function extractBaseTitle(rawTitle) {
     .trim();
 }
 
-async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targetType, processedSeriesKeys) {
+async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targetType, processedSeriesCache) {
   const itemTab = await browser.newPage();
   await itemTab.setViewport({ width: 1920, height: 1080 });
   await itemTab.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36');
@@ -164,7 +164,6 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
     await new Promise(r => setTimeout(r, 1200));
 
     let pageDetails = await itemTab.evaluate(() => {
-      // 1. استخراج رابط وهوية المسلسل الرئيسية إن وجد
       let seriesTitle = null;
       let seriesUrl = null;
       
@@ -177,7 +176,6 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
         seriesUrl = seriesAnchor.getAttribute('href');
       }
 
-      // 2. استخراج البوستر المباشر الشامل (دعم Meta و JSON-LD و CSS)
       let poster = '';
       const metaOgImage = document.querySelector('meta[property="og:image"]');
       const metaTwImage = document.querySelector('meta[name="twitter:image"]');
@@ -218,14 +216,12 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
         }
       }
 
-      // 3. القصة
       let story = '';
       const storyEl = document.querySelector('.StoryMovieContent, .AsideContext .StoryMovieContent, .PostStory, [itemprop="description"]');
       if (storyEl) {
         story = storyEl.innerText.trim();
       }
 
-      // 4. السيرفرات
       const domServers = [];
       document.querySelectorAll('ul#watch li, .WatchServersList li, [data-watch]').forEach(li => {
         let url = li.getAttribute('data-watch') || li.getAttribute('data-url');
@@ -236,7 +232,6 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
         }
       });
 
-      // 5. التقييم
       let rating = null;
       const rateEl = document.querySelector('.IMDB--Rating, .Rate--Single, [itemprop="ratingValue"]');
       if (rateEl) {
@@ -244,14 +239,12 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
         if (match) rating = parseFloat(match[1]);
       }
 
-      // 6. التصنيفات
       const genres = [];
       document.querySelectorAll('a[href*="/genre/"]').forEach(a => {
         const txt = a.innerText.trim();
         if (txt && !genres.includes(txt)) genres.push(txt);
       });
 
-      // 7. استخراج قائمة الحلقات (فحص شامل لكافة الحاويات الممكنة)
       const episodesList = [];
       const epElements = document.querySelectorAll(
         '.EpisodesList a, .Episodes--List a, .Seasons--Episodes .EpisodesList a, .List--Episodes a, .Singles--Episodes a, .Episodes--Seasons--Episodes a, a[href*="/episode/"], a[href*="/watch/"]'
@@ -276,7 +269,6 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
         }
       });
 
-      // 8. استخراج المواسم
       const seasonsList = [];
       document.querySelectorAll('.SeasonsList ul li a').forEach(a => {
         seasonsList.push({
@@ -307,10 +299,10 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
 
     const isSeriesItem = targetType === 'series' || item.isSeries || pageDetails.seriesTitle !== null;
 
-    // القفز الذكي: إذا كان مسلسلاً وخرج بـ 0 حلقة ولديه رابط صفحة المسلسل الرئيسي، ننتقل فوراً لصفحة المسلسل الأصلية لجلب الحلقات
+    // القفز لصفحة المسلسل الأصلية إذا كان مسلسلاً وخرج بصفر حلقة
     if (isSeriesItem && pageDetails.episodesList.length === 0 && pageDetails.seriesUrl) {
       try {
-        console.log(`🚀 [القفز لصفحة المسلسل الأم]: جلب الحلقات كاملة من ${pageDetails.seriesUrl}`);
+        console.log(`🚀 [القفز لصفحة المسلسل الأصلية]: ${pageDetails.seriesUrl}`);
         const fullSeriesUrl = pageDetails.seriesUrl.startsWith('http') ? pageDetails.seriesUrl : `${PRIMARY_DOMAIN}${pageDetails.seriesUrl}`;
         await safeNavigate(itemTab, fullSeriesUrl, detailUrl);
         await itemTab.waitForSelector('.EpisodesList a, .List--Episodes, .Episodes--List', { timeout: 3500 }).catch(() => {});
@@ -338,7 +330,7 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
 
         if (extraEpisodes && extraEpisodes.length > 0) {
           pageDetails.episodesList = extraEpisodes;
-          console.log(`✨ تم استخراج ${extraEpisodes.length} حلقة بنجاح من صفحة المسلسل الأم!`);
+          console.log(`✨ تم استخراج ${extraEpisodes.length} حلقة بنجاح من صفحة المسلسل!`);
         }
       } catch (err) {
         console.log('ملاحظة أثناء استخراج صفحة المسلسل الأم:', err.message);
@@ -349,13 +341,8 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
 
     const contentType = isSeriesItem ? 'series' : targetType;
     const baseTitle = extractBaseTitle(pageDetails.seriesTitle || item.title);
-    const seriesKey = pageDetails.seriesUrl || (isSeriesItem ? baseTitle : item.path);
-
-    if (isSeriesItem && processedSeriesKeys.has(seriesKey)) {
-      console.log(`⏩ [تخطي تكرار مؤكد]: تم فحص المسلسل وحفظ شجرته مسبقاً (${baseTitle})`);
-      await itemTab.close().catch(() => {});
-      return true;
-    }
+    const finalTitle = isSeriesItem ? baseTitle : extractBaseTitle(item.title);
+    const finalPageUrl = isSeriesItem && pageDetails.seriesUrl ? pageDetails.seriesUrl : item.path;
 
     const allServers = [...capturedEmbeds, ...pageDetails.domServers];
     if (directPlayUrl) allServers.unshift({ name: 'بث مباشر رئيسي (Direct)', url: directPlayUrl });
@@ -372,9 +359,39 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
     let finalPoster = pageDetails.poster || item.poster || '';
     if (finalPoster.startsWith('//')) finalPoster = 'https:' + finalPoster;
 
-    const finalTitle = isSeriesItem ? baseTitle : extractBaseTitle(item.title);
-    const finalPageUrl = isSeriesItem && pageDetails.seriesUrl ? pageDetails.seriesUrl : item.path;
-    const hasEpisodes = pageDetails.episodesList && pageDetails.episodesList.length > 0;
+    // -------------------------------------------------------------
+    // منطق دمج الحلقات الجديدة في حال كان المسلسل مسجلاً مسبقاً
+    // -------------------------------------------------------------
+    let mergedEpisodes = pageDetails.episodesList || [];
+    const existingSeriesRecord = processedSeriesCache.get(baseTitle);
+
+    if (isSeriesItem && existingSeriesRecord) {
+      const oldEpisodes = existingSeriesRecord.extra_data?.episodes || [];
+      const episodeMap = new Map();
+      oldEpisodes.forEach(ep => episodeMap.set(ep.url, ep));
+
+      // إذا كانت الصفحة الحالية حلقة منفصلة وسيرفراتها متوفرة، نضمن وجودها
+      if (pageDetails.episodeNumber) {
+        episodeMap.set(item.path, {
+          title: `الحلقة ${pageDetails.episodeNumber}`,
+          url: item.path,
+          episode_number: pageDetails.episodeNumber,
+          servers: finalServers
+        });
+      }
+
+      // دمج أي حلقات مستخرجة جديدة مع القديمة
+      for (const newEp of pageDetails.episodesList) {
+        if (!episodeMap.has(newEp.url)) {
+          episodeMap.set(newEp.url, newEp);
+        }
+      }
+
+      mergedEpisodes = Array.from(episodeMap.values());
+      console.log(`🔄 [تحديث ودمج المسلسل]: تم دمج الحلقات، الإجمالي الآن: ${mergedEpisodes.length} حلقة.`);
+    }
+
+    const hasEpisodes = mergedEpisodes.length > 0;
 
     await db('contents?on_conflict=page_url', {
       method: 'POST',
@@ -399,7 +416,7 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
           season_name: pageDetails.seasonName || null,
           episode_number: pageDetails.episodeNumber || null,
           seasons: pageDetails.seasonsList.length > 0 ? pageDetails.seasonsList : undefined,
-          episodes: hasEpisodes ? pageDetails.episodesList : undefined,
+          episodes: hasEpisodes ? mergedEpisodes : undefined,
           status: 'success'
         },
         updated_at: new Date().toISOString()
@@ -407,11 +424,14 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
     });
 
     if (isSeriesItem && hasEpisodes) {
-      if (seriesKey) processedSeriesKeys.add(seriesKey);
-      processedSeriesKeys.add(baseTitle);
+      processedSeriesCache.set(baseTitle, {
+        title: finalTitle,
+        page_url: finalPageUrl,
+        extra_data: { episodes: mergedEpisodes }
+      });
     }
 
-    console.log(`✅ تم الحفظ: ${finalTitle} | بوستر: ${finalPoster ? 'متوفر' : 'غير متوفر'} | حلقات: ${pageDetails.episodesList.length}`);
+    console.log(`✅ تم الحفظ: ${finalTitle} | بوستر: ${finalPoster ? 'متوفر' : 'غير متوفر'} | حلقات: ${mergedEpisodes.length}`);
     await itemTab.close().catch(() => {});
     return true;
 
@@ -423,7 +443,7 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
 }
 
 async function run() {
-  console.log('🚀 بدء تشغيل الكاشط الشامل (معالجة الصفحة كاملة + البوسترات + شجرة الحلقات)...');
+  console.log('🚀 بدء تشغيل الكاشط الذكي الشامل (دعم الحلقات الجديدة + المراقبة الحية للعروض الحديثة)...');
 
   let state = (await db('scraper_state?id=eq.1&select=*'))?.[0];
   if (!state) {
@@ -434,13 +454,20 @@ async function run() {
 
   let targetIndex = (state.target_index || 0) % CATEGORY_ORDER.length;
   let page = state.current_page || 1;
-  const target = CATEGORY_ORDER[targetIndex];
+  const isArchiveDone = state.initial_archive_done === 1;
 
+  // إذا اكتمل كشط كامل الأرشيف، نتحول تلقائياً لوضع "المراقبة الحية" لصفحة البداية لرصد الجديد فوراً
+  if (isArchiveDone) {
+    page = 1;
+    console.log(`📡 [وضع المراقبة الحية للعروض الحديثة نشط]: جاري فحص أحدث التحديثات في القسم...`);
+  }
+
+  const target = CATEGORY_ORDER[targetIndex];
   const targetUrl = target.path === '/' 
     ? (page === 1 ? `${PRIMARY_DOMAIN}/` : `${PRIMARY_DOMAIN}/page/${page}/`)
     : `${PRIMARY_DOMAIN}${target.path}`.replace(/\/+$/, '') + (page === 1 ? '/' : `/page/${page}/`);
 
-  console.log(`🌐 [صفحة: ${page}] | الهدف: ${targetUrl} (قسم: ${target.category})`);
+  console.log(`🌐 [صفحة: ${page}] | الهدف: ${targetUrl} (قسم: ${target.category} [${targetIndex + 1}/${CATEGORY_ORDER.length}])`);
 
   const browser = await puppeteer.launch({
     headless: 'new',
@@ -454,7 +481,7 @@ async function run() {
   await safeNavigate(mainTab, `${PRIMARY_DOMAIN}/`);
   await safeNavigate(mainTab, targetUrl, `${PRIMARY_DOMAIN}/`);
 
-  // استخراج جميع البطاقات من واجهة القسم
+  // استخراج البطاقات
   const rawItems = await mainTab.evaluate(() => {
     const list = [];
     document.querySelectorAll('.Thumb--GridItem').forEach(el => {
@@ -503,61 +530,89 @@ async function run() {
   const items = Array.from(uniqueMap.values());
   console.log(`📦 العناصر المستخرجة من الصفحة: ${items.length} عنصر.`);
 
-  // استرجاع أحدث العناوين المسجلة من قاعدة البيانات لتفادي تكرار المسلسلات
-  const processedSeriesKeys = new Set();
+  // جلب أحدث المسلسلات المسجلة من Supabase مع مصفوفة حلقاتها لاكتشاف أي حلقة جديدة
+  const processedSeriesCache = new Map();
   try {
-    const existingTitles = await db(`contents?select=title&limit=250&order=id.desc`);
-    if (existingTitles && existingTitles.length > 0) {
-      existingTitles.forEach(r => {
-        if (r.title) processedSeriesKeys.add(r.title);
+    const existingSeries = await db(`contents?type=eq.series&select=title,page_url,extra_data&limit=300&order=id.desc`);
+    if (existingSeries && existingSeries.length > 0) {
+      existingSeries.forEach(r => {
+        if (r.title) processedSeriesCache.set(r.title, r);
       });
     }
   } catch (e) {
-    console.log('ملاحظة أثناء استرجاع العناوين المسجلة مسبقاً:', e.message);
+    console.log('ملاحظة أثناء تحميل كاش المسلسلات:', e.message);
   }
 
-  // فلترة العناصر المكررة في نفس قائمة الصفحة
+  // فلترة ذكية: إذا كان فيلماً مسجلاً نتخطاه، أما إذا كان مسلسلاً فنفحص إن كانت الحلقة جديدة
   const filteredItems = [];
-  const seenPageBaseTitles = new Set();
+  const seenInCurrentPage = new Set();
 
   for (const item of items) {
     const base = extractBaseTitle(item.title);
     if (item.isSeries) {
-      if (seenPageBaseTitles.has(base) || processedSeriesKeys.has(base)) {
+      const cached = processedSeriesCache.get(base);
+      if (cached && cached.extra_data?.episodes) {
+        // فحص هل رابط هذه الحلقة موجود مسبقاً داخل حلقات المسلسل
+        const episodeExists = cached.extra_data.episodes.some(ep => ep.url === item.path);
+        if (episodeExists) {
+          continue; // تم حفظ هذه الحلقة مسبقاً داخل المسلسل -> تخطي
+        } else {
+          console.log(`🔥 [رصد حلقة جديدة لمسلسل مسجل]: ${item.title}`);
+        }
+      }
+      if (seenInCurrentPage.has(base)) {
         continue;
       }
-      seenPageBaseTitles.add(base);
+      seenInCurrentPage.add(base);
     }
     filteredItems.push(item);
   }
 
-  console.log(`✨ عناصر فريدة للتنفيذ بعد فلترة التكرار: ${filteredItems.length} (تم استبعاد ${items.length - filteredItems.length} مكرر).`);
+  console.log(`✨ عناصر جديدة تستحق الفحص والتحديث: ${filteredItems.length} عنصر.`);
 
-  // معالجة الصفحة بالكامل دون تقييد بـ 10 عناصر
+  // معالجة كافة العناصر المستحقة في الصفحة
   for (const item of filteredItems) {
     console.log(`🔍 بدء فحص: ${item.title}`);
-    await scrapeSingleItem(browser, item, targetUrl, target.category, target.type, processedSeriesKeys);
+    await scrapeSingleItem(browser, item, targetUrl, target.category, target.type, processedSeriesCache);
     await new Promise(r => setTimeout(r, 600));
   }
 
   await browser.close();
 
-  // تدوير الأقسام والصفحات
+  // -------------------------------------------------------------
+  // تدوير الأقسام والصفحات والانتقال إلى وضع المراقبة الحية الدائمة
+  // -------------------------------------------------------------
   let nextIndex = targetIndex + 1;
   let nextPage = page;
+  let archiveFinished = state.initial_archive_done || 0;
+
   if (nextIndex >= CATEGORY_ORDER.length) {
     nextIndex = 0;
-    nextPage = page + 1;
-    console.log(`🏁 اكتملت دورة الصفحة (${page}) لجميع الأقسام الـ 18. الانتقال للصفحة (${nextPage})...`);
+    if (!isArchiveDone) {
+      nextPage = page + 1;
+      console.log(`🏁 اكتملت دورة الصفحة (${page}) لكافة الأقسام. الانتقال للصفحة (${nextPage})...`);
+    } else {
+      nextPage = 1; // البقاء في وضع مراقبة الصفحة الأولى لكل الأقسام
+    }
   }
-  if (nextPage > 50) nextPage = 1;
+
+  // عند تجاوز الصفحة 50 نعلن اكتمال الأرشفة والتحول الدائم للمراقبة الحية
+  if (nextPage > 50) {
+    nextPage = 1;
+    archiveFinished = 1;
+    console.log('🏆 [تم اكتمال أرشفة الموقع بالكامل!] الانتقال الدائم الآن إلى وضع المراقبة الحية للعروض الحصرية والجديدة.');
+  }
 
   await db('scraper_state?id=eq.1', {
     method: 'PATCH',
-    body: JSON.stringify({ target_index: nextIndex, current_page: nextPage })
+    body: JSON.stringify({ 
+      target_index: nextIndex, 
+      current_page: nextPage,
+      initial_archive_done: archiveFinished
+    })
   });
 
-  console.log(`🎉 تم الانتهاء بنجاح. المحطة التالية: دورة ${nextPage} - قسم ${CATEGORY_ORDER[nextIndex].category}`);
+  console.log(`🎉 تم الانتهاء بنجاح. المحطة التالية: [قسم: ${CATEGORY_ORDER[nextIndex].category}] - صفحة ${nextPage}`);
 }
 
 run().catch(err => {
