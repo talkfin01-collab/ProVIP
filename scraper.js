@@ -28,7 +28,7 @@ const CATEGORY_ORDER = [
   { path: '/category/%d9%85%d8%b3%d9%84%d8%b3%d9%84%d8%a7%d8%aa-%d9%87%d9%86%d8%af%d9%8a%d8%a9/', category: 'series_indian', type: 'series' },
   { path: '/category/%d9%85%d8%b3%d9%84%d8%b3%d9%84%d8%a7%d8%aa-%d8%a7%d9%86%d9%85%d9%8a/', category: 'series_anime', type: 'series' },
   { path: '/category/%d9%85%d8%b3%d9%84%d8%b3%d9%84%d8%a7%d8%aa-%d9%85%d8%af%d8%a8%d9%84%d8%ac%d8%a9/', category: 'series_dubbed', type: 'series' },
-  { path: '/category/%d8%a8%d8%b1%d8%a7%d9%85%d8%ac-%d8%aa%d9%84%d9%81%d8%b2%d9%8a%d9%86%d9%8a%d8%a9/', category: 'tv_shows', type: 'series' },
+  { path: '/category/%d8%a8%d8%b1%d8%a7%d9%85%d8%ac-%d8%aa%d9%84%d9%81%d8%b2%d9%8a%d9%88%d9%86%d9%8a%d8%a9/', category: 'tv_shows', type: 'series' },
   { path: '/category/%d8%b9%d8%b1%d9%88%d8%b6-%d9%85%d8%b5%d8%a7%d8%b1%d8%b9%d8%a9/', category: 'wrestling', type: 'wrestling' },
   { path: '/category/%d9%85%d8%b3%d8%b1%d8%ad%d9%8a%d8%a7%d8%aa-%d8%b9%d8%b1%d8%a8%d9%8a%d8%a9/', category: 'theater', type: 'theater' }
 ];
@@ -115,12 +115,64 @@ function extractBaseTitle(rawTitle) {
     .replace(/\s*حلقة\s+\d+/gi, '')
     .trim();
 
-  // إزالة تكرار السنوات المزدوجة والمفردة
   clean = clean.replace(/(\(\s*\d{4}\s*\)\s*)+$/g, '').trim();
   clean = clean.replace(/\s*\b(19\d\d|20\d\d)\b\s*$/g, '').trim();
   clean = clean.replace(/\s*اون\b/gi, '').trim();
 
   return clean;
+}
+
+// دالة مساعدة لاستخراج الحلقات من أي صفحة
+async function extractEpisodesFromPage(pageTab) {
+  return await pageTab.evaluate(() => {
+    const list = [];
+    const seen = new Set();
+    document.querySelectorAll('.EpisodesList a, .Episodes--List a, .List--Episodes a, .Episodes--Seasons--Episodes a, a[href*="/episode/"], a[href*="/watch/"]').forEach(a => {
+      const href = a.getAttribute('href');
+      if (!href || href.startsWith('#') || href.includes('javascript:') || seen.has(href)) return;
+      const titleEl = a.querySelector('episodetitle') || a.querySelector('span') || a;
+      const epTitle = titleEl.innerText.trim();
+      if (href.includes('حلقة') || href.includes('الحلقة') || href.includes('/watch/') || epTitle.includes('حلقة') || epTitle.includes('الحلقة')) {
+        seen.add(href);
+        const numMatch = epTitle.match(/(\d+)/);
+        list.push({
+          title: epTitle || 'حلقة',
+          url: href,
+          episode_number: numMatch ? parseInt(numMatch[1], 10) : null
+        });
+      }
+    });
+    return list;
+  });
+}
+
+// مطابقة واستخراج كافة المواسم غير النشطة بنظام الدفعات (Reconcile Seasons)
+async function reconcileOtherSeasons(itemTab, seasonsList, currentUrl, baseEpisodeMap) {
+  if (!seasonsList || seasonsList.length <= 1) return;
+
+  const seasonsToFetch = seasonsList.filter(s => s.url && !currentUrl.includes(s.url));
+  if (seasonsToFetch.length === 0) return;
+
+  console.log(`🧭 [تسوية المواسم]: تم رصد ${seasonsToFetch.length} مواسم إضافية، جاري فحص الحلقات...`);
+
+  // فحص بنظام دفعات (CHUNK_SIZE = 3 لضمان استقرار Puppeteer)
+  const CHUNK_SIZE = 3;
+  for (let i = 0; i < seasonsToFetch.length; i += CHUNK_SIZE) {
+    const chunk = seasonsToFetch.slice(i, i + CHUNK_SIZE);
+    for (const season of chunk) {
+      try {
+        const fullSeasonUrl = season.url.startsWith('http') ? season.url : `${PRIMARY_DOMAIN}${season.url}`;
+        await safeNavigate(itemTab, fullSeasonUrl, currentUrl);
+        await itemTab.waitForSelector('.EpisodesList a, .List--Episodes', { timeout: 3000 }).catch(() => {});
+        const seasonEps = await extractEpisodesFromPage(itemTab);
+        for (const ep of seasonEps) {
+          if (!baseEpisodeMap.has(ep.url)) {
+            baseEpisodeMap.set(ep.url, Object.assign({}, ep, { season_title: season.title }));
+          }
+        }
+      } catch (e) {}
+    }
+  }
 }
 
 async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targetType, processedSeriesCache) {
@@ -317,34 +369,14 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
 
     const isSeriesItem = targetType === 'series' || item.isSeries || pageDetails.seriesTitle !== null;
 
+    // القفز لصفحة المسلسل الأصلية إذا كان مسلسلاً وخرج بصفر حلقة
     if (isSeriesItem && pageDetails.episodesList.length === 0 && pageDetails.seriesUrl) {
       try {
         console.log(`🚀 [القفز لصفحة المسلسل الأصلية]: ${pageDetails.seriesUrl}`);
         const fullSeriesUrl = pageDetails.seriesUrl.startsWith('http') ? pageDetails.seriesUrl : `${PRIMARY_DOMAIN}${pageDetails.seriesUrl}`;
         await safeNavigate(itemTab, fullSeriesUrl, detailUrl);
         await itemTab.waitForSelector('.EpisodesList a, .List--Episodes, .Episodes--List', { timeout: 3500 }).catch(() => {});
-
-        const extraEpisodes = await itemTab.evaluate(() => {
-          const list = [];
-          const seen = new Set();
-          document.querySelectorAll('.EpisodesList a, .Episodes--List a, .List--Episodes a, .Episodes--Seasons--Episodes a, a[href*="/episode/"], a[href*="/watch/"]').forEach(a => {
-            const href = a.getAttribute('href');
-            if (!href || href.startsWith('#') || href.includes('javascript:') || seen.has(href)) return;
-            const titleEl = a.querySelector('episodetitle') || a.querySelector('span') || a;
-            const epTitle = titleEl.innerText.trim();
-            if (href.includes('حلقة') || href.includes('الحلقة') || href.includes('/watch/') || epTitle.includes('حلقة') || epTitle.includes('الحلقة')) {
-              seen.add(href);
-              const numMatch = epTitle.match(/(\d+)/);
-              list.push({
-                title: epTitle || 'حلقة',
-                url: href,
-                episode_number: numMatch ? parseInt(numMatch[1], 10) : null
-              });
-            }
-          });
-          return list;
-        });
-
+        const extraEpisodes = await extractEpisodesFromPage(itemTab);
         if (extraEpisodes && extraEpisodes.length > 0) {
           pageDetails.episodesList = extraEpisodes;
           console.log(`✨ تم استخراج ${extraEpisodes.length} حلقة بنجاح من صفحة المسلسل!`);
@@ -354,12 +386,38 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
       }
     }
 
+    // -------------------------------------------------------------------
+    // دمج الحلقات وتفعيل آلية تسوية المواسم المتعددة (Reconcile Seasons)
+    // -------------------------------------------------------------------
+    const baseTitle = extractBaseTitle(pageDetails.seriesTitle || item.title);
+    const existingSeriesRecord = processedSeriesCache.get(baseTitle);
+
+    const episodeMap = new Map();
+    if (existingSeriesRecord && existingSeriesRecord.extra_data?.episodes) {
+      existingSeriesRecord.extra_data.episodes.forEach(ep => episodeMap.set(ep.url, ep));
+    }
+
+    if (pageDetails.episodeNumber) {
+      episodeMap.set(item.path, {
+        title: `الحلقة ${pageDetails.episodeNumber}`,
+        url: item.path,
+        episode_number: pageDetails.episodeNumber,
+        servers: capturedEmbeds
+      });
+    }
+
+    for (const ep of pageDetails.episodesList) {
+      if (!episodeMap.has(ep.url)) episodeMap.set(ep.url, ep);
+    }
+
+    // زيارة المواسم الأخرى ومطابقتها إذا كان مسلسلاً
+    if (isSeriesItem && pageDetails.seasonsList && pageDetails.seasonsList.length > 1) {
+      await reconcileOtherSeasons(itemTab, pageDetails.seasonsList, detailUrl, episodeMap);
+    }
+
     itemTab.off('request', networkSniffer);
 
     const contentType = isSeriesItem ? 'series' : targetType;
-    const baseTitle = extractBaseTitle(pageDetails.seriesTitle || item.title);
-    
-    // تنسيق العنوان النهائي بأناقة مع السنة
     const finalTitle = isSeriesItem ? baseTitle : `${baseTitle} (${item.year})`;
     const finalPageUrl = isSeriesItem && pageDetails.seriesUrl ? pageDetails.seriesUrl : item.path;
 
@@ -378,33 +436,7 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
     let finalPoster = pageDetails.poster || item.poster || '';
     if (finalPoster.startsWith('//')) finalPoster = 'https:' + finalPoster;
 
-    let mergedEpisodes = pageDetails.episodesList || [];
-    const existingSeriesRecord = processedSeriesCache.get(baseTitle);
-
-    if (isSeriesItem && existingSeriesRecord) {
-      const oldEpisodes = existingSeriesRecord.extra_data?.episodes || [];
-      const episodeMap = new Map();
-      oldEpisodes.forEach(ep => episodeMap.set(ep.url, ep));
-
-      if (pageDetails.episodeNumber) {
-        episodeMap.set(item.path, {
-          title: `الحلقة ${pageDetails.episodeNumber}`,
-          url: item.path,
-          episode_number: pageDetails.episodeNumber,
-          servers: finalServers
-        });
-      }
-
-      for (const newEp of pageDetails.episodesList) {
-        if (!episodeMap.has(newEp.url)) {
-          episodeMap.set(newEp.url, newEp);
-        }
-      }
-
-      mergedEpisodes = Array.from(episodeMap.values());
-      console.log(`🔄 [تحديث ودمج المسلسل]: تم دمج الحلقات، الإجمالي الآن: ${mergedEpisodes.length} حلقة.`);
-    }
-
+    const mergedEpisodes = Array.from(episodeMap.values());
     const hasEpisodes = mergedEpisodes.length > 0;
 
     await db('contents?on_conflict=page_url', {
@@ -452,12 +484,29 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
   } catch (err) {
     console.log(`⚠️ فشل فحص (${item.title}): ${err.message}`);
     await itemTab.close().catch(() => {});
+
+    // تسجيل الصفحة الفاشلة في جدول failed_jobs لإعادة المحاولة لاحقاً
+    try {
+      await db('failed_jobs', {
+        method: 'POST',
+        body: JSON.stringify([{
+          target_path: item.path,
+          category: targetCategory,
+          type: targetType,
+          page: 1,
+          retry_count: 0,
+          error_msg: err.message
+        }])
+      });
+      console.log(`📌 تم إدراج (${item.title}) في جدول failed_jobs لإعادة المحاولة.`);
+    } catch (e) {}
+
     return false;
   }
 }
 
 async function run() {
-  console.log('🚀 بدء تشغيل الكاشط الذكي الشامل (دعم الحلقات الجديدة + المراقبة الحية للعروض الحديثة)...');
+  console.log('🚀 بدء تشغيل الكاشط الذكي الشامل (دعم الحلقات الجديدة + المراقبة الحية + failed_jobs)...');
 
   let state = (await db('scraper_state?id=eq.1&select=*'))?.[0];
   if (!state) {
@@ -466,6 +515,40 @@ async function run() {
     state = defaultState[0];
   }
 
+  const browser = await puppeteer.launch({
+    headless: 'new',
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--window-size=1920,1080']
+  });
+
+  // -------------------------------------------------------------
+  // 1. فحص وإعادة محاولة الوظائف الفاشلة أولاً (failed_jobs)
+  // -------------------------------------------------------------
+  try {
+    const failedJobs = await db('failed_jobs?retry_count=lt.3&order=id.asc&limit=3');
+    if (failedJobs && failedJobs.length > 0) {
+      console.log(`🛠️ [معالجة المهام الفاشلة]: جاري إعادة محاولة ${failedJobs.length} مهام معلقة...`);
+      for (const job of failedJobs) {
+        const dummyItem = { path: job.target_path, title: job.target_path, year: 2026, isSeries: job.type === 'series' };
+        const success = await scrapeSingleItem(browser, dummyItem, PRIMARY_DOMAIN, job.category, job.type, new Map());
+        if (success) {
+          await db(`failed_jobs?id=eq.${job.id}`, { method: 'DELETE' });
+          console.log(`🎯 تم حل المهمة الفاشلة وحذفها من failed_jobs بنجاح: ${job.target_path}`);
+        } else {
+          const newCount = (job.retry_count || 0) + 1;
+          await db(`failed_jobs?id=eq.${job.id}`, {
+            method: 'PATCH',
+            body: JSON.stringify({ retry_count: newCount })
+          });
+        }
+      }
+    }
+  } catch (e) {
+    console.log('ملاحظة أثناء فحص failed_jobs:', e.message);
+  }
+
+  // -------------------------------------------------------------
+  // 2. إكمال دورة الكشط الطبيعية
+  // -------------------------------------------------------------
   let targetIndex = (state.target_index || 0) % CATEGORY_ORDER.length;
   let page = state.current_page || 1;
   const isArchiveDone = state.initial_archive_done === 1;
@@ -481,11 +564,6 @@ async function run() {
     : `${PRIMARY_DOMAIN}${target.path}`.replace(/\/+$/, '') + (page === 1 ? '/' : `/page/${page}/`);
 
   console.log(`🌐 [صفحة: ${page}] | الهدف: ${targetUrl} (قسم: ${target.category} [${targetIndex + 1}/${CATEGORY_ORDER.length}])`);
-
-  const browser = await puppeteer.launch({
-    headless: 'new',
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--window-size=1920,1080']
-  });
 
   const mainTab = await browser.newPage();
   await mainTab.setViewport({ width: 1920, height: 1080 });
