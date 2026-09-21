@@ -28,7 +28,7 @@ const CATEGORY_ORDER = [
   { path: '/category/%d9%85%d8%b3%d9%84%d8%b3%d9%84%d8%a7%d8%aa-%d9%87%d9%86%d8%af%d9%8a%d8%a9/', category: 'series_indian', type: 'series' },
   { path: '/category/%d9%85%d8%b3%d9%84%d8%b3%d9%84%d8%a7%d8%aa-%d8%a7%d9%86%d9%85%d9%8a/', category: 'series_anime', type: 'series' },
   { path: '/category/%d9%85%d8%b3%d9%84%d8%b3%d9%84%d8%a7%d8%aa-%d9%85%d8%af%d8%a8%d9%84%d8%ac%d8%a9/', category: 'series_dubbed', type: 'series' },
-  { path: '/category/%d8%a8%d8%b1%d8%a7%d9%85%d8%ac-%d8%aa%d9%84%d9%81%d8%b2%d9%8a%d9%88%d9%86%d9%8a%d8%a9/', category: 'tv_shows', type: 'series' },
+  { path: '/category/%d8%a8%d8%b1%d8%a7%d9%85%d8%ac-%d8%aa%d9%84%d9%81%d8%b2%d9%8a%d9%86%d9%8a%d8%a9/', category: 'tv_shows', type: 'series' },
   { path: '/category/%d8%b9%d8%b1%d9%88%d8%b6-%d9%85%d8%b5%d8%a7%d8%b1%d8%b9%d8%a9/', category: 'wrestling', type: 'wrestling' },
   { path: '/category/%d9%85%d8%b3%d8%b1%d8%ad%d9%8a%d8%a7%d8%aa-%d8%b9%d8%b1%d8%a8%d9%8a%d8%a9/', category: 'theater', type: 'theater' }
 ];
@@ -98,6 +98,7 @@ async function safeNavigate(page, url, referer = '') {
   return title;
 }
 
+// دالة تطهير وتنقية أسماء الأعمال بدقة متناهية
 function extractBaseTitle(rawTitle) {
   return rawTitle
     .replace(/^مشاهدة\s+/i, '')
@@ -109,9 +110,9 @@ function extractBaseTitle(rawTitle) {
     .replace(/\s*الموسم\s+([^\s]+)/gi, '')
     .replace(/\s*الحلقة\s+\d+/gi, '')
     .replace(/\s*الحلقة\s+[\u0621-\u064A]+/gi, '')
+    .replace(/\s*(الاولى|الثانية|الثالثة|الرابعة|الخامسة|السادسة|السابعة|الثامنة|التاسعة|العاشرة|الحادية عشر|الثانية عشر|الثالثة عشر|الرابعة عشر|الخامسة عشر|السادسة عشر|السابعة عشر|الثامنة عشر|التاسعة عشر|العشرون|والاخيرة|الاخيرة)/gi, '')
     .replace(/\s*حلقة\s+\d+/gi, '')
-    .replace(/\s*والاخيرة/gi, '')
-    .replace(/\s*\(\s*\d{4}\s*\)\s*$/g, '')
+    .replace(/\s*\(?\s*\b(19\d\d\vert{}20\d\d)\b\s*\)?$/g, '')
     .trim();
 }
 
@@ -163,139 +164,150 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
     await itemTab.waitForSelector('.EpisodesList a, .Seasons--Episodes, .List--Episodes, .Episodes--List', { timeout: 3500 }).catch(() => {});
     await new Promise(r => setTimeout(r, 1200));
 
-    let pageDetails = await itemTab.evaluate(() => {
-      let seriesTitle = null;
-      let seriesUrl = null;
-      
-      const seriesAnchor = document.querySelector('.Terms--Content--Single-begin li a[href*="/series/"]') ||
-                           document.querySelector('.Series--Section > a[href*="/series/"]') ||
-                           document.querySelector('a.series--name') ||
-                           document.querySelector('a[href*="/series/"]');
-      if (seriesAnchor) {
-        seriesTitle = seriesAnchor.innerText.trim();
-        seriesUrl = seriesAnchor.getAttribute('href');
-      }
-
-      let poster = '';
-      const metaOgImage = document.querySelector('meta[property="og:image"]');
-      const metaTwImage = document.querySelector('meta[name="twitter:image"]');
-      
-      if (metaOgImage && metaOgImage.content && !metaOgImage.content.includes('logo')) {
-        poster = metaOgImage.content;
-      } else if (metaTwImage && metaTwImage.content && !metaTwImage.content.includes('logo')) {
-        poster = metaTwImage.content;
-      }
-
-      if (!poster) {
-        try {
-          const schemaEl = document.querySelector('script.yoast-schema-graph, script[type="application/ld+json"]');
-          if (schemaEl) {
-            const schemaData = JSON.parse(schemaEl.innerText);
-            const graph = schemaData['@graph'] || [schemaData];
-            for (const node of graph) {
-              if (node.thumbnailUrl) { poster = node.thumbnailUrl; break; }
-              if (node.image && node.image.url) { poster = node.image.url; break; }
-            }
-          }
-        } catch (e) {}
-      }
-
-      if (!poster) {
-        const wecimaEl = document.querySelector('wecima, .wecima--single--poster, .Poster--Single-begin');
-        if (wecimaEl) {
-          const rawStyle = wecimaEl.getAttribute('style') || '';
-          const m = rawStyle.match(/--img:\s*url\(([^)]+)\)/i) || rawStyle.match(/url\(['"]?([^'")]+)['"]?\)/i);
-          if (m) poster = m[1].replace(/['"]/g, '');
-        }
-      }
-
-      if (!poster) {
-        const imgEl = document.querySelector('.Poster--Single-begin img, .wecima--single--poster img, [itemprop="image"], .Poster--Single img');
-        if (imgEl) {
-          poster = imgEl.getAttribute('data-src') || imgEl.getAttribute('data-lazy-src') || imgEl.src || '';
-        }
-      }
-
-      let story = '';
-      const storyEl = document.querySelector('.StoryMovieContent, .AsideContext .StoryMovieContent, .PostStory, [itemprop="description"]');
-      if (storyEl) {
-        story = storyEl.innerText.trim();
-      }
-
-      const domServers = [];
-      document.querySelectorAll('ul#watch li, .WatchServersList li, [data-watch]').forEach(li => {
-        let url = li.getAttribute('data-watch') || li.getAttribute('data-url');
-        const name = li.innerText.trim() || 'سيرفر مشاهدة';
-        if (url && !url.startsWith('#') && !url.startsWith('javascript:')) {
-          if (url.startsWith('//')) url = 'https:' + url;
-          domServers.push({ name, url });
-        }
-      });
-
-      let rating = null;
-      const rateEl = document.querySelector('.IMDB--Rating, .Rate--Single, [itemprop="ratingValue"]');
-      if (rateEl) {
-        const match = rateEl.innerText.match(/(\d+(\.\d+)?)/);
-        if (match) rating = parseFloat(match[1]);
-      }
-
-      const genres = [];
-      document.querySelectorAll('a[href*="/genre/"]').forEach(a => {
-        const txt = a.innerText.trim();
-        if (txt && !genres.includes(txt)) genres.push(txt);
-      });
-
-      const episodesList = [];
-      const epElements = document.querySelectorAll(
-        '.EpisodesList a, .Episodes--List a, .Seasons--Episodes .EpisodesList a, .List--Episodes a, .Singles--Episodes a, .Episodes--Seasons--Episodes a, a[href*="/episode/"], a[href*="/watch/"]'
-      );
-      
-      const seenEps = new Set();
-      epElements.forEach(a => {
-        const href = a.getAttribute('href');
-        if (!href || href.startsWith('#') || href.includes('javascript:') || seenEps.has(href)) return;
-
-        const titleEl = a.querySelector('episodetitle') || a.querySelector('span') || a;
-        const epTitle = titleEl.innerText.trim();
+    // استخراج بيانات الصفحة مع آلية حماية من خطأ تدمير سياق التنفيذ (Execution context destroyed)
+    const extractDetails = async () => {
+      return await itemTab.evaluate(() => {
+        let seriesTitle = null;
+        let seriesUrl = null;
         
-        if (href.includes('حلقة') || href.includes('الحلقة') || href.includes('/watch/') || epTitle.includes('حلقة') || epTitle.includes('الحلقة')) {
-          seenEps.add(href);
-          const numMatch = epTitle.match(/(\d+)/);
-          episodesList.push({
-            title: epTitle || 'حلقة',
-            url: href,
-            episode_number: numMatch ? parseInt(numMatch[1], 10) : null
-          });
+        const seriesAnchor = document.querySelector('.Terms--Content--Single-begin li a[href*="/series/"]') ||
+                             document.querySelector('.Series--Section > a[href*="/series/"]') ||
+                             document.querySelector('a.series--name') ||
+                             document.querySelector('a[href*="/series/"]');
+        if (seriesAnchor) {
+          seriesTitle = seriesAnchor.innerText.trim();
+          seriesUrl = seriesAnchor.getAttribute('href');
         }
-      });
 
-      const seasonsList = [];
-      document.querySelectorAll('.SeasonsList ul li a').forEach(a => {
-        seasonsList.push({
-          title: a.innerText.trim(),
-          season_id: a.getAttribute('data-season') || null,
-          url: a.getAttribute('href') || null
+        let poster = '';
+        const metaOgImage = document.querySelector('meta[property="og:image"]');
+        const metaTwImage = document.querySelector('meta[name="twitter:image"]');
+        
+        if (metaOgImage && metaOgImage.content && !metaOgImage.content.includes('logo')) {
+          poster = metaOgImage.content;
+        } else if (metaTwImage && metaTwImage.content && !metaTwImage.content.includes('logo')) {
+          poster = metaTwImage.content;
+        }
+
+        if (!poster) {
+          try {
+            const schemaEl = document.querySelector('script.yoast-schema-graph, script[type="application/ld+json"]');
+            if (schemaEl) {
+              const schemaData = JSON.parse(schemaEl.innerText);
+              const graph = schemaData['@graph'] || [schemaData];
+              for (const node of graph) {
+                if (node.thumbnailUrl) { poster = node.thumbnailUrl; break; }
+                if (node.image && node.image.url) { poster = node.image.url; break; }
+              }
+            }
+          } catch (e) {}
+        }
+
+        if (!poster) {
+          const wecimaEl = document.querySelector('wecima, .wecima--single--poster, .Poster--Single-begin');
+          if (wecimaEl) {
+            const rawStyle = wecimaEl.getAttribute('style') || '';
+            const m = rawStyle.match(/--img:\s*url\(([^)]+)\)/i) || rawStyle.match(/url\(['"]?([^'")]+)['"]?\)/i);
+            if (m) poster = m[1].replace(/['"]/g, '');
+          }
+        }
+
+        if (!poster) {
+          const imgEl = document.querySelector('.Poster--Single-begin img, .wecima--single--poster img, [itemprop="image"], .Poster--Single img');
+          if (imgEl) {
+            poster = imgEl.getAttribute('data-src') || imgEl.getAttribute('data-lazy-src') || imgEl.src || '';
+          }
+        }
+
+        let story = '';
+        const storyEl = document.querySelector('.StoryMovieContent, .AsideContext .StoryMovieContent, .PostStory, [itemprop="description"]');
+        if (storyEl) {
+          story = storyEl.innerText.trim();
+        }
+
+        const domServers = [];
+        document.querySelectorAll('ul#watch li, .WatchServersList li, [data-watch]').forEach(li => {
+          let url = li.getAttribute('data-watch') || li.getAttribute('data-url');
+          const name = li.innerText.trim() || 'سيرفر مشاهدة';
+          if (url && !url.startsWith('#') && !url.startsWith('javascript:')) {
+            if (url.startsWith('//')) url = 'https:' + url;
+            domServers.push({ name, url });
+          }
         });
+
+        let rating = null;
+        const rateEl = document.querySelector('.IMDB--Rating, .Rate--Single, [itemprop="ratingValue"]');
+        if (rateEl) {
+          const match = rateEl.innerText.match(/(\d+(\.\d+)?)/);
+          if (match) rating = parseFloat(match[1]);
+        }
+
+        const genres = [];
+        document.querySelectorAll('a[href*="/genre/"]').forEach(a => {
+          const txt = a.innerText.trim();
+          if (txt && !genres.includes(txt)) genres.push(txt);
+        });
+
+        const episodesList = [];
+        const epElements = document.querySelectorAll(
+          '.EpisodesList a, .Episodes--List a, .Seasons--Episodes .EpisodesList a, .List--Episodes a, .Singles--Episodes a, .Episodes--Seasons--Episodes a, a[href*="/episode/"], a[href*="/watch/"]'
+        );
+        
+        const seenEps = new Set();
+        epElements.forEach(a => {
+          const href = a.getAttribute('href');
+          if (!href || href.startsWith('#') || href.includes('javascript:') || seenEps.has(href)) return;
+
+          const titleEl = a.querySelector('episodetitle') || a.querySelector('span') || a;
+          const epTitle = titleEl.innerText.trim();
+          
+          if (href.includes('حلقة') || href.includes('الحلقة') || href.includes('/watch/') || epTitle.includes('حلقة') || epTitle.includes('الحلقة')) {
+            seenEps.add(href);
+            const numMatch = epTitle.match(/(\d+)/);
+            episodesList.push({
+              title: epTitle || 'حلقة',
+              url: href,
+              episode_number: numMatch ? parseInt(numMatch[1], 10) : null
+            });
+          }
+        });
+
+        const seasonsList = [];
+        document.querySelectorAll('.SeasonsList ul li a').forEach(a => {
+          seasonsList.push({
+            title: a.innerText.trim(),
+            season_id: a.getAttribute('data-season') || null,
+            url: a.getAttribute('href') || null
+          });
+        });
+
+        const h1Text = document.querySelector('h1[itemprop="name"]')?.innerText || document.title;
+        const seasonMatch = h1Text.match(/الموسم\s+([^\s]+)/);
+        const episodeMatch = h1Text.match(/الحلقة\s+(\d+)/);
+
+        return {
+          seriesTitle,
+          seriesUrl,
+          poster,
+          story,
+          domServers,
+          rating,
+          genres,
+          episodesList,
+          seasonsList,
+          seasonName: seasonMatch ? seasonMatch[1] : null,
+          episodeNumber: episodeMatch ? parseInt(episodeMatch[1], 10) : null
+        };
       });
+    };
 
-      const h1Text = document.querySelector('h1[itemprop="name"]')?.innerText || document.title;
-      const seasonMatch = h1Text.match(/الموسم\s+([^\s]+)/);
-      const episodeMatch = h1Text.match(/الحلقة\s+(\d+)/);
-
-      return {
-        seriesTitle,
-        seriesUrl,
-        poster,
-        story,
-        domServers,
-        rating,
-        genres,
-        episodesList,
-        seasonsList,
-        seasonName: seasonMatch ? seasonMatch[1] : null,
-        episodeNumber: episodeMatch ? parseInt(episodeMatch[1], 10) : null
-      };
-    });
+    let pageDetails;
+    try {
+      pageDetails = await extractDetails();
+    } catch (e) {
+      await new Promise(r => setTimeout(r, 1500));
+      pageDetails = await extractDetails();
+    }
 
     const isSeriesItem = targetType === 'series' || item.isSeries || pageDetails.seriesTitle !== null;
 
@@ -474,6 +486,7 @@ async function run() {
   await safeNavigate(mainTab, `${PRIMARY_DOMAIN}/`);
   await safeNavigate(mainTab, targetUrl, `${PRIMARY_DOMAIN}/`);
 
+  // استخراج البطاقات مع فك تشفير الروابط للتعرف التلقائي على المسلسلات في الأقسام المختلطة
   const rawItems = await mainTab.evaluate(() => {
     const list = [];
     document.querySelectorAll('.Thumb--GridItem').forEach(el => {
@@ -506,7 +519,20 @@ async function run() {
 
       const yearMatch = el.innerText.match(/\b(19\d\d|20\d\d)\b/);
       const year = yearMatch ? parseInt(yearMatch[1], 10) : 2026;
-      const isSeries = path.includes('مسلسل') || path.includes('حلقة');
+
+      let decodedPath = '';
+      try {
+        decodedPath = decodeURIComponent(path);
+      } catch (e) {
+        decodedPath = path;
+      }
+
+      // التعرف الدقيق على المسلسلات في أي قسم حتى لو كان latest
+      const isSeries = title.includes('مسلسل') || 
+                       title.includes('حلقة') || 
+                       title.includes('الموسم') || 
+                       decodedPath.includes('مسلسل') || 
+                       decodedPath.includes('حلقة');
 
       list.push({ path, title, poster, year, isSeries });
     });
@@ -522,7 +548,7 @@ async function run() {
   const items = Array.from(uniqueMap.values());
   console.log(`📦 العناصر المستخرجة من الصفحة: ${items.length} عنصر.`);
 
-  // 1. فحص العناصر غير التابعة للمسلسلات المسجلة مسبقاً (لتخطي الأفلام والعروض الفردية الموجودة مسبقاً)
+  // 1. فحص العناصر غير التابعة للمسلسلات المسجلة مسبقاً برابطها
   const nonSeriesPaths = items.filter(i => !i.isSeries).map(i => `"${i.path}"`);
   const existingNonSeriesPaths = new Set();
   if (nonSeriesPaths.length > 0) {
@@ -536,7 +562,7 @@ async function run() {
     }
   }
 
-  // 2. تحميل كاش المسلسلات المسجلة لفحص الحلقات الجديدة
+  // 2. تحميل كاش المسلسلات المسجلة لاكتشاف الحلقات الجديدة
   const processedSeriesCache = new Map();
   try {
     const existingSeries = await db(`contents?type=eq.series&select=title,page_url,extra_data&limit=350&order=id.desc`);
@@ -553,7 +579,6 @@ async function run() {
   const seenInCurrentPage = new Set();
 
   for (const item of items) {
-    // إذا كان فيلماً أو عرضاً فردياً مسجلاً مسبقاً برابطه، نتخطاه فوراً
     if (!item.isSeries && existingNonSeriesPaths.has(item.path)) {
       continue;
     }
@@ -564,13 +589,13 @@ async function run() {
       if (cached && cached.extra_data?.episodes) {
         const episodeExists = cached.extra_data.episodes.some(ep => ep.url === item.path);
         if (episodeExists) {
-          continue;
+          continue; // الحلقة مسجلة مسبقاً -> تخطي
         } else {
           console.log(`🔥 [رصد حلقة جديدة لمسلسل مسجل]: ${item.title}`);
         }
       }
       if (seenInCurrentPage.has(base)) {
-        continue;
+        continue; // منع التكرار لنفس المسلسل داخل نفس الصفحة
       }
       seenInCurrentPage.add(base);
     }
