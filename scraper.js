@@ -98,7 +98,7 @@ async function safeNavigate(page, url, referer = '') {
   return title;
 }
 
-// دالة تطهير وتنقية أسماء الأعمال بدقة متناهية للأفلام والمسلسلات
+// دالة متطورة لتنقية أسماء الأفلام والمسلسلات وتجريد التكرار تماماً
 function extractBaseTitle(rawTitle) {
   let clean = rawTitle
     .replace(/^مشاهدة\s+/i, '')
@@ -116,8 +116,10 @@ function extractBaseTitle(rawTitle) {
     .replace(/\s*حلقة\s+\d+/gi, '')
     .trim();
 
-  // إزالة تكرار السنة في نهاية العنوان إذا كانت مسبوقة بنفس السنة
-  clean = clean.replace(/\s*\(\s*\b(19\d\d\vert{}20\d\d)\b\s*\)\s*$/g, '').trim();
+  // إزالة تكرار السنوات المزدوجة مثل ( 1988 ) ( 1988 )
+  clean = clean.replace(/(\(\s*\d{4}\s*\)\s*)+$/g, '').trim();
+  clean = clean.replace(/\s*\b(19\d\d|20\d\d)\b\s*$/g, '').trim();
+
   return clean;
 }
 
@@ -356,7 +358,9 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
 
     const contentType = isSeriesItem ? 'series' : targetType;
     const baseTitle = extractBaseTitle(pageDetails.seriesTitle || item.title);
-    const finalTitle = isSeriesItem ? baseTitle : extractBaseTitle(item.title);
+    
+    // تنسيق العنوان النهائي بأناقة مع السنة
+    const finalTitle = isSeriesItem ? baseTitle : `${baseTitle} (${item.year})`;
     const finalPageUrl = isSeriesItem && pageDetails.seriesUrl ? pageDetails.seriesUrl : item.path;
 
     const allServers = [...capturedEmbeds, ...pageDetails.domServers];
