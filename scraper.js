@@ -98,7 +98,8 @@ async function safeNavigate(page, url, referer = '') {
   return title;
 }
 
-function sanitizeTitle(rawTitle) {
+// دالة تنظيف وتجريد العناوين لاستخراج هوية العمل الأصلية
+function extractBaseTitle(rawTitle) {
   return rawTitle
     .replace(/^مشاهدة\s+/i, '')
     .replace(/\s*-\s*وي سيما.*$/i, '')
@@ -106,11 +107,15 @@ function sanitizeTitle(rawTitle) {
     .replace(/\s*اون\s*لاين/gi, '')
     .replace(/\s*مترجمة?/gi, '')
     .replace(/\s*مدبلجة?/gi, '')
+    .replace(/\s*الموسم\s+([^\s]+)/gi, '')
+    .replace(/\s*الحلقة\s+\d+/gi, '')
+    .replace(/\s*الحلقة\s+[\u0621-\u064A]+/gi, '')
+    .replace(/\s*حلقة\s+\d+/gi, '')
     .replace(/\s*\(\s*\d{4}\s*\)\s*$/g, '')
     .trim();
 }
 
-async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targetType, processedSeriesUrls) {
+async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targetType, processedSeriesKeys) {
   const itemTab = await browser.newPage();
   await itemTab.setViewport({ width: 1920, height: 1080 });
   await itemTab.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36');
@@ -148,6 +153,7 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
     const detailUrl = `${PRIMARY_DOMAIN}${item.path}`;
     await safeNavigate(itemTab, detailUrl, refererUrl);
 
+    // محاولة النقر على زر السيرفر بهدوء لتنشيط استخراج الرابط
     try {
       await itemTab.evaluate(() => {
         const btn = document.querySelector('ul#watch li:first-child, .WatchServersList li:first-child, .Watch--Btn, .btn--watch');
@@ -155,7 +161,9 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
       });
     } catch (e) {}
 
-    await new Promise(r => setTimeout(r, 1800));
+    // انتظار تحميل قسم الحلقات إذا وُجد في الصفحة
+    await itemTab.waitForSelector('.EpisodesList a, .Seasons--Episodes', { timeout: 4000 }).catch(() => {});
+    await new Promise(r => setTimeout(r, 1500));
 
     const pageDetails = await itemTab.evaluate(() => {
       // 1. استخراج رابط وهوية المسلسل الرئيسية إن وجد
@@ -228,9 +236,11 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
         if (txt && !genres.includes(txt)) genres.push(txt);
       });
 
-      // 7. استخراج قائمة الحلقات بالكامل من جدول الحلقات الفعلي
+      // 7. استخراج قائمة الحلقات (فحص دقيق لكافة الحاويات المحتملة)
       const episodesList = [];
-      document.querySelectorAll('.EpisodesList a').forEach(a => {
+      const epElements = document.querySelectorAll('.EpisodesList a, .Seasons--Episodes .EpisodesList a, a[href*="/episode/"]');
+      
+      epElements.forEach(a => {
         const href = a.getAttribute('href');
         const titleEl = a.querySelector('episodetitle') || a;
         const epTitle = titleEl.innerText.trim();
@@ -275,10 +285,15 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
 
     itemTab.off('request', networkSniffer);
 
-    // التحقق من تكرار المسلسل: إذا كان المسلسل قد عولج في نفس الجلسة أو مسجل برابطه الأم
-    const seriesKey = pageDetails.seriesUrl || (pageDetails.seriesTitle ? sanitizeTitle(pageDetails.seriesTitle) : null);
-    if (seriesKey && processedSeriesUrls.has(seriesKey)) {
-      console.log(`⏩ [تخطي تكرار]: تم معالجة وتخزين المسلسل مسبقاً (${pageDetails.seriesTitle || item.title})`);
+    const isSeriesItem = targetType === 'series' || item.isSeries || pageDetails.seriesTitle !== null;
+    const contentType = isSeriesItem ? 'series' : targetType;
+
+    // تحديد المفتاح الأساسي لمنع التكرار
+    const baseTitle = extractBaseTitle(pageDetails.seriesTitle || item.title);
+    const seriesKey = pageDetails.seriesUrl || (isSeriesItem ? baseTitle : item.path);
+
+    if (isSeriesItem && processedSeriesKeys.has(seriesKey)) {
+      console.log(`⏩ [تخطي تكرار مؤكد]: تم فحص المسلسل وحفظ شجرته مسبقاً (${baseTitle})`);
       await itemTab.close().catch(() => {});
       return true;
     }
@@ -298,15 +313,9 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
     let finalPoster = pageDetails.poster || item.poster || '';
     if (finalPoster.startsWith('//')) finalPoster = 'https:' + finalPoster;
 
-    const isSeriesItem = targetType === 'series' || item.isSeries || pageDetails.seriesTitle !== null;
-    const contentType = isSeriesItem ? 'series' : targetType;
-
-    // استخدام اسم المسلسل الرئيسي عنواناً للمسلسلات بدلاً من اسم الحلقة المفردة
-    const finalTitle = isSeriesItem && pageDetails.seriesTitle 
-      ? sanitizeTitle(pageDetails.seriesTitle) 
-      : sanitizeTitle(item.title);
-
-    // إذا كان مسلسلاً، نعتمد رابط المسلسل كـ page_url لتجنب إنشاء صف لكل حلقة، وإلا نستخدم رابط الصفحة
+    // العنوان المعتمد
+    const finalTitle = isSeriesItem ? baseTitle : extractBaseTitle(item.title);
+    // الرابط المعتمد كسجل أساسي في قاعدة البيانات
     const finalPageUrl = isSeriesItem && pageDetails.seriesUrl ? pageDetails.seriesUrl : item.path;
 
     await db('contents?on_conflict=page_url', {
@@ -339,7 +348,10 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
       }])
     });
 
-    if (seriesKey) processedSeriesUrls.add(seriesKey);
+    if (isSeriesItem) {
+      processedSeriesKeys.add(seriesKey);
+      processedSeriesKeys.add(baseTitle);
+    }
 
     console.log(`✅ تم الحفظ: ${finalTitle} | بوستر: ${finalPoster ? 'متوفر' : 'غير متوفر'} | حلقات: ${pageDetails.episodesList.length}`);
     await itemTab.close().catch(() => {});
@@ -353,7 +365,7 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
 }
 
 async function run() {
-  console.log('🚀 بدء تشغيل الكاشط (معالجة البوسترات للأفلام والمسلسلات + منع التكرار)...');
+  console.log('🚀 بدء تشغيل الكاشط الذكي (تجريد العناوين + منع تكرار المسلسلات + جلب البوسترات)...');
 
   let state = (await db('scraper_state?id=eq.1&select=*'))?.[0];
   if (!state) {
@@ -384,7 +396,7 @@ async function run() {
   await safeNavigate(mainTab, `${PRIMARY_DOMAIN}/`);
   await safeNavigate(mainTab, targetUrl, `${PRIMARY_DOMAIN}/`);
 
-  // استخراج العناصر من شبكة العرض والتقاط الـ data-lazy-style و CSS variables
+  // استخراج البطاقات
   const rawItems = await mainTab.evaluate(() => {
     const list = [];
     document.querySelectorAll('.Thumb--GridItem').forEach(el => {
@@ -398,9 +410,7 @@ async function run() {
       const title = titleEl ? titleEl.innerText.trim() : (linkEl.getAttribute('title') || '');
       if (!title) return;
 
-      // فحص شامل لصور البطاقات في واجهة القسم (أفلام ومسلسلات)
       let poster = '';
-
       const bgSpan = el.querySelector('.BG--GridItem');
       if (bgSpan) {
         const lazyStyle = bgSpan.getAttribute('data-lazy-style') || bgSpan.getAttribute('style') || '';
@@ -428,46 +438,56 @@ async function run() {
 
   await mainTab.close().catch(() => {});
 
-  // فلترة العناصر الفريدة المستخرجة من الصفحة
   const uniqueMap = new Map();
   for (const it of rawItems) {
     if (!uniqueMap.has(it.path)) uniqueMap.set(it.path, it);
   }
   const items = Array.from(uniqueMap.values());
-  console.log(`📦 العناصر المستخرجة: ${items.length} عنصر.`);
+  console.log(`📦 العناصر المستخرجة من الصفحة: ${items.length} عنصر.`);
 
-  // فحص قاعدة البيانات لتخطي العناصر التي تمت أرشفتها مسبقاً (تخطي التكرار)
-  const pathsToCheck = items.map(i => `"${i.path}"`).join(',');
-  let existingUrls = new Set();
+  // فحص قاعدة البيانات لتخطي ما تم حفظه مسبقاً
+  const processedSeriesKeys = new Set();
   try {
-    const existing = await db(`contents?select=page_url&page_url=in.(${encodeURIComponent(pathsToCheck)})`);
-    if (existing && existing.length > 0) {
-      existing.forEach(r => existingUrls.add(r.page_url));
+    const existingTitles = await db(`contents?select=title&limit=200&order=id.desc`);
+    if (existingTitles && existingTitles.length > 0) {
+      existingTitles.forEach(r => {
+        if (r.title) processedSeriesKeys.add(r.title);
+      });
     }
   } catch (e) {
-    console.log('ملاحظة أثناء فحص التكرار المسبق:', e.message);
+    console.log('ملاحظة أثناء استرجاع العناوين المسجلة مسبقاً:', e.message);
   }
 
-  const itemsToProcess = items.filter(it => !existingUrls.has(it.path));
-  console.log(`✨ عناصر جديدة تتطلب المعالجة بعد فحص التكرار: ${itemsToProcess.length} (تم تخطي ${items.length - itemsToProcess.length} مكرر).`);
+  // فلترة العناصر المكررة في نفس قائمة الصفحة قبل البدء
+  const filteredItems = [];
+  const seenPageBaseTitles = new Set();
 
-  const processedSeriesUrls = new Set();
+  for (const item of items) {
+    const base = extractBaseTitle(item.title);
+    if (item.isSeries) {
+      if (seenPageBaseTitles.has(base) || processedSeriesKeys.has(base)) {
+        continue; // تخطي التكرار فورا بدون فتح التبويب
+      }
+      seenPageBaseTitles.add(base);
+    }
+    filteredItems.push(item);
+  }
 
-  for (const item of itemsToProcess.slice(0, 10)) {
+  console.log(`✨ عناصر فريدة للتنفيذ بعد فلترة التكرار: ${filteredItems.length} (تم استبعاد ${items.length - filteredItems.length} مكرر).`);
+
+  for (const item of filteredItems.slice(0, 10)) {
     console.log(`🔍 بدء فحص: ${item.title}`);
-    await scrapeSingleItem(browser, item, targetUrl, target.category, target.type, processedSeriesUrls);
+    await scrapeSingleItem(browser, item, targetUrl, target.category, target.type, processedSeriesKeys);
     await new Promise(r => setTimeout(r, 600));
   }
 
   await browser.close();
 
-  // تدوير الأقسام والصفحات
   let nextIndex = targetIndex + 1;
   let nextPage = page;
   if (nextIndex >= CATEGORY_ORDER.length) {
     nextIndex = 0;
     nextPage = page + 1;
-    console.log(`🏁 اكتملت دورة الصفحة (${page}) لجميع الأقسام الـ 18. الانتقال للصفحة (${nextPage})...`);
   }
   if (nextPage > 50) nextPage = 1;
 
