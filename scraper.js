@@ -98,7 +98,6 @@ async function safeNavigate(page, url, referer = '') {
   return title;
 }
 
-// دالة تطهير وتنقية شاملة تزيل الأرقام المعطوفة والمركبة بالكامل
 function extractBaseTitle(rawTitle) {
   let clean = rawTitle
     .replace(/^مشاهدة\s+/i, '')
@@ -112,25 +111,19 @@ function extractBaseTitle(rawTitle) {
     .replace(/\s*الموسم\s+([^\s]+)/gi, '')
     .replace(/\s*الحلقة\s+\d+/gi, '')
     .replace(/\s*حلقة\s+\d+/gi, '')
-    // 1. حذف الأرقام المعطوفة المركبة مثل (الحادية والثلاثون، الخامسة والعشرون، إلخ)
     .replace(/\s*(الحادية|الثانية|الثالثة|الرابعة|الخامسة|السادسة|السابعة|الثامنة|التاسعة)\s+و\s*(العشرون|الثلاثون|الاربعون|الخمسون)/gi, '')
-    // 2. حذف الأعداد المركبة مثل (الخامسة عشر، الحادية عشر، إلخ)
     .replace(/\s*(الحادية|الثانية|الثالثة|الرابعة|الخامسة|السادسة|السابعة|الثامنة|التاسعة)\s+عشر/gi, '')
-    // 3. حذف الأعداد الترتيبية المفردة والعقود
     .replace(/\s*(الاولى|الثانية|الثالثة|الرابعة|الخامسة|السادسة|السابعة|الثامنة|التاسعة|العاشرة|العشرون|الثلاثون|الاربعون|الخمسون|عشر)/gi, '')
     .replace(/\s*(والاخيرة|الاخيرة)/gi, '')
     .trim();
 
-  // إزالة تكرار السنوات المزدوجة والمفردة
   clean = clean.replace(/(\(\s*\d{4}\s*\)\s*)+$/g, '').trim();
   clean = clean.replace(/\s*\b(19\d\d|20\d\d)\b\s*$/g, '').trim();
-  // إزالة أي حرف عطف يتيم متبقي في نهاية العنوان
   clean = clean.replace(/\s+و$/gi, '').trim();
 
   return clean;
 }
 
-// دالة مساعدة لاستخراج الحلقات من الصفحة
 async function extractEpisodesFromPage(pageTab) {
   return await pageTab.evaluate(() => {
     const list = [];
@@ -154,7 +147,6 @@ async function extractEpisodesFromPage(pageTab) {
   });
 }
 
-// مطابقة واستخراج كافة المواسم غير النشطة
 async function reconcileOtherSeasons(itemTab, seasonsList, currentUrl, baseEpisodeMap) {
   if (!seasonsList || seasonsList.length <= 1) return;
 
@@ -195,12 +187,17 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
     window.prompt = () => null;
   });
 
+  await itemTab.setRequestInterception(true);
+
   let directPlayUrl = '';
   const capturedEmbeds = [];
   const seenUrls = new Set();
 
-  const networkSniffer = (req) => {
+  itemTab.on('request', (req) => {
     const u = req.url();
+    const resType = req.resourceType();
+
+    // صيد البث المباشر
     if (u.includes('govid.live/video-') || u.includes('govid.live/play/') || u.includes('.m3u8') || u.includes('.mp4')) {
       if (!directPlayUrl) {
         directPlayUrl = u;
@@ -212,9 +209,14 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
         capturedEmbeds.push({ name: 'مشغل مدمج (govid)', url: u });
       }
     }
-  };
 
-  itemTab.on('request', networkSniffer);
+    // تسريع التصفح بحظر الخطوط والوسائط الثانوية
+    if (resType === 'font' || (resType === 'media' && !u.includes('govid'))) {
+      req.abort();
+    } else {
+      req.continue();
+    }
+  });
 
   try {
     const detailUrl = `${PRIMARY_DOMAIN}${item.path}`;
@@ -417,8 +419,6 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
       await reconcileOtherSeasons(itemTab, pageDetails.seasonsList, detailUrl, episodeMap);
     }
 
-    itemTab.off('request', networkSniffer);
-
     const contentType = isSeriesItem ? 'series' : targetType;
     const finalTitle = isSeriesItem ? baseTitle : `${baseTitle} (${item.year})`;
     const finalPageUrl = isSeriesItem && pageDetails.seriesUrl ? pageDetails.seriesUrl : item.path;
@@ -438,7 +438,10 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
     let finalPoster = pageDetails.poster || item.poster || '';
     if (finalPoster.startsWith('//')) finalPoster = 'https:' + finalPoster;
 
-    const mergedEpisodes = Array.from(episodeMap.values());
+    // ترتيب مصفوفة الحلقات تصاعدياً لضمان سلامة العرض في التطبيق
+    const mergedEpisodes = Array.from(episodeMap.values()).sort((a, b) => {
+      return (a.episode_number || 0) - (b.episode_number || 0);
+    });
     const hasEpisodes = mergedEpisodes.length > 0;
 
     await db('contents?on_conflict=page_url', {
@@ -628,6 +631,18 @@ async function run() {
   }
   const items = Array.from(uniqueMap.values());
   console.log(`📦 العناصر المستخرجة من الصفحة: ${items.length} عنصر.`);
+
+  // معالجة انتهاء صفحات القسم: إذا كانت الصفحة فارغة ننتقل فوراً للقسم التالي
+  if (items.length === 0 && !isArchiveDone) {
+    console.log(`ℹ️ القسم (${target.category}) لا يحتوي على عناصر إضافية في الصفحة (${page}). الانتقال للقسم التالي...`);
+    let nextIndex = (targetIndex + 1) % CATEGORY_ORDER.length;
+    await db('scraper_state?id=eq.1', {
+      method: 'PATCH',
+      body: JSON.stringify({ target_index: nextIndex, current_page: 1 })
+    });
+    await browser.close();
+    return;
+  }
 
   const nonSeriesPaths = items.filter(i => !i.isSeries).map(i => `"${i.path}"`);
   const existingNonSeriesPaths = new Set();
