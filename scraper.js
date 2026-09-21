@@ -98,13 +98,15 @@ async function safeNavigate(page, url, referer = '') {
   return title;
 }
 
-// دالة تطهير وتنقية أسماء الأعمال بدقة متناهية
+// دالة تطهير وتنقية أسماء الأعمال بدقة متناهية للأفلام والمسلسلات
 function extractBaseTitle(rawTitle) {
-  return rawTitle
+  let clean = rawTitle
     .replace(/^مشاهدة\s+/i, '')
     .replace(/\s*-\s*وي سيما.*$/i, '')
     .replace(/\s*-\s*ماي سيما.*$/i, '')
     .replace(/\s*اون\s*لاين/gi, '')
+    .replace(/\s*اون\b/gi, '')
+    .replace(/\s*كامل(ة)?/gi, '')
     .replace(/\s*مترجمة?/gi, '')
     .replace(/\s*مدبلجة?/gi, '')
     .replace(/\s*الموسم\s+([^\s]+)/gi, '')
@@ -112,8 +114,11 @@ function extractBaseTitle(rawTitle) {
     .replace(/\s*الحلقة\s+[\u0621-\u064A]+/gi, '')
     .replace(/\s*(الاولى|الثانية|الثالثة|الرابعة|الخامسة|السادسة|السابعة|الثامنة|التاسعة|العاشرة|الحادية عشر|الثانية عشر|الثالثة عشر|الرابعة عشر|الخامسة عشر|السادسة عشر|السابعة عشر|الثامنة عشر|التاسعة عشر|العشرون|والاخيرة|الاخيرة)/gi, '')
     .replace(/\s*حلقة\s+\d+/gi, '')
-    .replace(/\s*\(?\s*\b(19\d\d\vert{}20\d\d)\b\s*\)?$/g, '')
     .trim();
+
+  // إزالة تكرار السنة في نهاية العنوان إذا كانت مسبوقة بنفس السنة
+  clean = clean.replace(/\s*\(\s*\b(19\d\d\vert{}20\d\d)\b\s*\)\s*$/g, '').trim();
+  return clean;
 }
 
 async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targetType, processedSeriesCache) {
@@ -164,7 +169,6 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
     await itemTab.waitForSelector('.EpisodesList a, .Seasons--Episodes, .List--Episodes, .Episodes--List', { timeout: 3500 }).catch(() => {});
     await new Promise(r => setTimeout(r, 1200));
 
-    // استخراج بيانات الصفحة مع آلية حماية من خطأ تدمير سياق التنفيذ (Execution context destroyed)
     const extractDetails = async () => {
       return await itemTab.evaluate(() => {
         let seriesTitle = null;
@@ -486,7 +490,6 @@ async function run() {
   await safeNavigate(mainTab, `${PRIMARY_DOMAIN}/`);
   await safeNavigate(mainTab, targetUrl, `${PRIMARY_DOMAIN}/`);
 
-  // استخراج البطاقات مع فك تشفير الروابط للتعرف التلقائي على المسلسلات في الأقسام المختلطة
   const rawItems = await mainTab.evaluate(() => {
     const list = [];
     document.querySelectorAll('.Thumb--GridItem').forEach(el => {
@@ -527,7 +530,6 @@ async function run() {
         decodedPath = path;
       }
 
-      // التعرف الدقيق على المسلسلات في أي قسم حتى لو كان latest
       const isSeries = title.includes('مسلسل') || 
                        title.includes('حلقة') || 
                        title.includes('الموسم') || 
@@ -548,7 +550,6 @@ async function run() {
   const items = Array.from(uniqueMap.values());
   console.log(`📦 العناصر المستخرجة من الصفحة: ${items.length} عنصر.`);
 
-  // 1. فحص العناصر غير التابعة للمسلسلات المسجلة مسبقاً برابطها
   const nonSeriesPaths = items.filter(i => !i.isSeries).map(i => `"${i.path}"`);
   const existingNonSeriesPaths = new Set();
   if (nonSeriesPaths.length > 0) {
@@ -562,7 +563,6 @@ async function run() {
     }
   }
 
-  // 2. تحميل كاش المسلسلات المسجلة لاكتشاف الحلقات الجديدة
   const processedSeriesCache = new Map();
   try {
     const existingSeries = await db(`contents?type=eq.series&select=title,page_url,extra_data&limit=350&order=id.desc`);
@@ -589,13 +589,13 @@ async function run() {
       if (cached && cached.extra_data?.episodes) {
         const episodeExists = cached.extra_data.episodes.some(ep => ep.url === item.path);
         if (episodeExists) {
-          continue; // الحلقة مسجلة مسبقاً -> تخطي
+          continue;
         } else {
           console.log(`🔥 [رصد حلقة جديدة لمسلسل مسجل]: ${item.title}`);
         }
       }
       if (seenInCurrentPage.has(base)) {
-        continue; // منع التكرار لنفس المسلسل داخل نفس الصفحة
+        continue;
       }
       seenInCurrentPage.add(base);
     }
