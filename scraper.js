@@ -25,7 +25,7 @@ const CATEGORY_ORDER = [
   { path: '/category/%d9%85%d8%b3%d9%84%d8%b3%d9%84%d8%a7%d8%aa-%d8%b9%d8%b1%d8%a8%d9%8a/', category: 'series_arabic', type: 'series' },
   { path: '/category/%d9%85%d8%b3%d9%84%d8%b3%d9%84%d8%a7%d8%aa-%d8%aa%d8%b1%d9%83%d9%8a%d8%a9/', category: 'series_turkish', type: 'series' },
   { path: '/category/%d9%85%d8%b3%d9%84%d8%b3%d9%84%d8%a7%d8%aa-%d8%a7%d8%b3%d9%8a%d9%88%d9%8a%d8%a9/', category: 'series_asian', type: 'series' },
-  { path: '/category/%d9%85%d8%b3%d9%84%d8%b3%d9%84%d8%a7%d8%aa-%d9%87%d9%86%d8%af%d9%8a%d8%a9/', category: 'series_indian', type: 'series' },
+  { path: '/category/%d9%85%d8%b3%d9%84%d8%b3%d9%84%d8%a7%d8%aa-%d9%87%d9%86%d8%af%d9%8a/', category: 'series_indian', type: 'series' },
   { path: '/category/%d9%85%d8%b3%d9%84%d8%b3%d9%84%d8%a7%d8%aa-%d8%a7%d9%86%d9%85%d9%8a/', category: 'series_anime', type: 'series' },
   { path: '/category/%d9%85%d8%b3%d9%84%d8%b3%d9%84%d8%a7%d8%aa-%d9%85%d8%af%d8%a8%d9%84%d8%ac%d8%a9/', category: 'series_dubbed', type: 'series' },
   { path: '/category/%d8%a8%d8%b1%d8%a7%d9%85%d8%ac-%d8%aa%d9%84%d9%81%d8%b2%d9%8a%d9%86%d9%8a%d8%a9/', category: 'tv_shows', type: 'series' },
@@ -105,7 +105,7 @@ function extractBaseTitle(rawTitle) {
     .replace(/\s*-\s*ماي سيما.*$/i, '')
     .replace(/\s*اون\s*لاين/gi, '')
     .replace(/\s*اون\b/gi, '')
-    .replace(/\s*كامل(ة)?/gi, '')
+    .replace(/\s*\bكامل(ة)?\b/gi, '')
     .replace(/\s*مترجمة?/gi, '')
     .replace(/\s*مدبلجة?/gi, '')
     .replace(/\s*الموسم\s+([^\s]+)/gi, '')
@@ -197,7 +197,6 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
     const u = req.url();
     const resType = req.resourceType();
 
-    // صيد البث المباشر
     if (u.includes('govid.live/video-') || u.includes('govid.live/play/') || u.includes('.m3u8') || u.includes('.mp4')) {
       if (!directPlayUrl) {
         directPlayUrl = u;
@@ -210,7 +209,6 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
       }
     }
 
-    // تسريع التصفح بحظر الخطوط والوسائط الثانوية
     if (resType === 'font' || (resType === 'media' && !u.includes('govid'))) {
       req.abort();
     } else {
@@ -438,7 +436,6 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
     let finalPoster = pageDetails.poster || item.poster || '';
     if (finalPoster.startsWith('//')) finalPoster = 'https:' + finalPoster;
 
-    // ترتيب مصفوفة الحلقات تصاعدياً لضمان سلامة العرض في التطبيق
     const mergedEpisodes = Array.from(episodeMap.values()).sort((a, b) => {
       return (a.episode_number || 0) - (b.episode_number || 0);
     });
@@ -632,7 +629,6 @@ async function run() {
   const items = Array.from(uniqueMap.values());
   console.log(`📦 العناصر المستخرجة من الصفحة: ${items.length} عنصر.`);
 
-  // معالجة انتهاء صفحات القسم: إذا كانت الصفحة فارغة ننتقل فوراً للقسم التالي
   if (items.length === 0 && !isArchiveDone) {
     console.log(`ℹ️ القسم (${target.category}) لا يحتوي على عناصر إضافية في الصفحة (${page}). الانتقال للقسم التالي...`);
     let nextIndex = (targetIndex + 1) % CATEGORY_ORDER.length;
