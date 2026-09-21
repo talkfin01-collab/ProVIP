@@ -81,17 +81,17 @@ async function solveTurnstileIfPresent(page) {
 }
 
 async function safeNavigate(page, url, referer = '') {
-  const options = { waitUntil: 'domcontentloaded', timeout: 60000 };
+  const options = { waitUntil: 'domcontentloaded', timeout: 45000 };
   if (referer) options.referer = referer;
 
   await page.goto(url, options);
   let title = await page.title();
   let retries = 0;
 
-  while ((title.includes('Just a moment') || title.includes('Cloudflare') || title.includes('Attention Required')) && retries < 8) {
-    console.log(`⏳ فحص Cloudflare نشط... انتظار الحل (محاولة ${retries + 1}/8)...`);
+  while ((title.includes('Just a moment') || title.includes('Cloudflare') || title.includes('Attention Required')) && retries < 6) {
+    console.log(`⏳ فحص Cloudflare نشط... انتظار الحل (محاولة ${retries + 1}/6)...`);
     await solveTurnstileIfPresent(page);
-    await new Promise(r => setTimeout(r, 3000));
+    await new Promise(r => setTimeout(r, 2500));
     title = await page.title();
     retries++;
   }
@@ -147,38 +147,38 @@ async function extractEpisodesFromPage(pageTab) {
   });
 }
 
-// دالة سريعة لصيد رابط الفيديو المباشر والسيرفرات لحلقة محددة
-async function resolveEpisodeStream(browser, epUrl, refererUrl) {
-  const epTab = await browser.newPage();
-  await epTab.setViewport({ width: 1280, height: 720 });
-  await epTab.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36');
-  await epTab.setRequestInterception(true);
-
-  let directStream = '';
-  const embeds = [];
-  const seenEmbeds = new Set();
-
-  epTab.on('request', (req) => {
-    const u = req.url();
-    const resType = req.resourceType();
-
-    if (u.includes('govid.live/video-') || u.includes('govid.live/play/') || u.includes('.m3u8') || u.includes('.mp4')) {
-      if (!directStream) directStream = u;
-    } else if (u.includes('govid.live/e/') || (u.includes('embed') && !u.includes('google') && !u.includes('doubleclick'))) {
-      if (!seenEmbeds.has(u)) {
-        seenEmbeds.add(u);
-        embeds.push({ name: 'مشغل مدمج (govid)', url: u });
-      }
-    }
-
-    if (resType === 'font' || resType === 'image' || (resType === 'media' && !u.includes('govid'))) {
-      req.abort();
-    } else {
-      req.continue();
-    }
-  });
-
+// فاحص رابط حلقة خفيف ومحمي بدون تسريب ذاكرة
+async function resolveEpisodeStreamSafe(browser, epUrl, refererUrl) {
+  let epTab = null;
   try {
+    epTab = await browser.newPage();
+    await epTab.setViewport({ width: 1280, height: 720 });
+    await epTab.setRequestInterception(true);
+
+    let stream = '';
+    const embeds = [];
+    const seenEmbeds = new Set();
+
+    epTab.on('request', (req) => {
+      const u = req.url();
+      const rType = req.resourceType();
+
+      if (u.includes('govid.live/video-') || u.includes('govid.live/play/') || u.includes('.m3u8') || u.includes('.mp4')) {
+        if (!stream) stream = u;
+      } else if (u.includes('govid.live/e/') || (u.includes('embed') && !u.includes('google'))) {
+        if (!seenEmbeds.has(u)) {
+          seenEmbeds.add(u);
+          embeds.push({ name: 'مشغل مدمج (govid)', url: u });
+        }
+      }
+
+      if (rType === 'image' || rType === 'font' || rType === 'stylesheet' || (rType === 'media' && !u.includes('govid'))) {
+        req.abort();
+      } else {
+        req.continue();
+      }
+    });
+
     const fullUrl = epUrl.startsWith('http') ? epUrl : `${PRIMARY_DOMAIN}${epUrl}`;
     await safeNavigate(epTab, fullUrl, refererUrl);
 
@@ -189,7 +189,7 @@ async function resolveEpisodeStream(browser, epUrl, refererUrl) {
       });
     } catch (e) {}
 
-    await new Promise(r => setTimeout(r, 1200));
+    await new Promise(r => setTimeout(r, 1000));
 
     const domServers = await epTab.evaluate(() => {
       const list = [];
@@ -205,15 +205,12 @@ async function resolveEpisodeStream(browser, epUrl, refererUrl) {
     });
 
     const allServers = [...embeds, ...domServers];
-    if (directStream) allServers.unshift({ name: 'بث مباشر رئيسي (Direct)', url: directStream });
+    if (stream) allServers.unshift({ name: 'بث مباشر رئيسي (Direct)', url: stream });
 
     await epTab.close().catch(() => {});
-    return {
-      stream_url: directStream || allServers[0]?.url || null,
-      servers: allServers
-    };
+    return { stream_url: stream || allServers[0]?.url || null, servers: allServers };
   } catch (err) {
-    await epTab.close().catch(() => {});
+    if (epTab) await epTab.close().catch(() => {});
     return { stream_url: null, servers: [] };
   }
 }
@@ -226,22 +223,18 @@ async function reconcileOtherSeasons(itemTab, seasonsList, currentUrl, baseEpiso
 
   console.log(`🧭 [تسوية المواسم]: تم رصد ${seasonsToFetch.length} مواسم إضافية، جاري فحص الحلقات...`);
 
-  const CHUNK_SIZE = 3;
-  for (let i = 0; i < seasonsToFetch.length; i += CHUNK_SIZE) {
-    const chunk = seasonsToFetch.slice(i, i + CHUNK_SIZE);
-    for (const season of chunk) {
-      try {
-        const fullSeasonUrl = season.url.startsWith('http') ? season.url : `${PRIMARY_DOMAIN}${season.url}`;
-        await safeNavigate(itemTab, fullSeasonUrl, currentUrl);
-        await itemTab.waitForSelector('.EpisodesList a, .List--Episodes', { timeout: 3000 }).catch(() => {});
-        const seasonEps = await extractEpisodesFromPage(itemTab);
-        for (const ep of seasonEps) {
-          if (!baseEpisodeMap.has(ep.url)) {
-            baseEpisodeMap.set(ep.url, Object.assign({}, ep, { season_title: season.title }));
-          }
+  for (const season of seasonsToFetch.slice(0, 2)) {
+    try {
+      const fullSeasonUrl = season.url.startsWith('http') ? season.url : `${PRIMARY_DOMAIN}${season.url}`;
+      await safeNavigate(itemTab, fullSeasonUrl, currentUrl);
+      await itemTab.waitForSelector('.EpisodesList a, .List--Episodes', { timeout: 3000 }).catch(() => {});
+      const seasonEps = await extractEpisodesFromPage(itemTab);
+      for (const ep of seasonEps) {
+        if (!baseEpisodeMap.has(ep.url)) {
+          baseEpisodeMap.set(ep.url, Object.assign({}, ep, { season_title: season.title }));
         }
-      } catch (e) {}
-    }
+      }
+    } catch (e) {}
   }
 }
 
@@ -299,7 +292,7 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
     } catch (e) {}
 
     await itemTab.waitForSelector('.EpisodesList a, .Seasons--Episodes, .List--Episodes, .Episodes--List', { timeout: 3500 }).catch(() => {});
-    await new Promise(r => setTimeout(r, 1200));
+    await new Promise(r => setTimeout(r, 1000));
 
     const extractDetails = async () => {
       return await itemTab.evaluate(() => {
@@ -441,7 +434,7 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
     try {
       pageDetails = await extractDetails();
     } catch (e) {
-      await new Promise(r => setTimeout(r, 1500));
+      await new Promise(r => setTimeout(r, 1200));
       pageDetails = await extractDetails();
     }
 
@@ -483,7 +476,10 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
       }
     }
 
-    // 1. تسجيل الحلقة الحالية مع رابط البث المباشر الصريح وسيرفراتها
+    // إغلاق تبويب العمل الأساسي فوراً لتحرير الذاكرة
+    await itemTab.close().catch(() => {});
+
+    // 1. تسجيل الحلقة الحالية مع رابط الفيديو المباشر وسيرفراتها
     if (pageDetails.episodeNumber) {
       const currentStream = directPlayUrl || finalServers[0]?.url || null;
       episodeMap.set(item.path, {
@@ -495,7 +491,7 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
       });
     }
 
-    // 2. دمج الحلقات الأخرى المكتشفة في الصفحة مع الحفاظ على ما تم صيده سابقاً
+    // 2. دمج الحلقات الأخرى
     for (const ep of pageDetails.episodesList) {
       if (!episodeMap.has(ep.url)) {
         episodeMap.set(ep.url, {
@@ -508,27 +504,20 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
       }
     }
 
-    if (isSeriesItem && pageDetails.seasonsList && pageDetails.seasonsList.length > 1) {
-      await reconcileOtherSeasons(itemTab, pageDetails.seasonsList, detailUrl, episodeMap);
-    }
-
-    // 3. فحص الحلقات التي ينقصها رابط بث مباشر (أحدث 3 حلقات لتفادي إطالة وقت التنفيذ)
+    // 3. فحص آمن لحلقة إضافية واحدة فقط في كل دورة لتفادي إجهاد الذاكرة والـ Timeout
     if (isSeriesItem) {
       const unstreamedEps = Array.from(episodeMap.values())
-        .filter(ep => !ep.stream_url && ep.url && ep.url !== item.path)
-        .slice(-3); // فحص أحدث 3 حلقات فقط لضمان سرعة الكاشط وتوفير الرابط فوراً
+        .filter(ep => !ep.stream_url && ep.url && !ep.url.includes(item.path))
+        .slice(-1);
 
-      if (unstreamedEps.length > 0) {
-        console.log(`🎬 [جلب روابط المشاهدة المباشرة]: فحص ${unstreamedEps.length} حلقات إضافية لمسلسل (${baseTitle})...`);
-        for (const targetEp of unstreamedEps) {
-          const resolved = await resolveEpisodeStream(browser, targetEp.url, detailUrl);
-          if (resolved.stream_url) {
-            targetEp.stream_url = resolved.stream_url;
-            targetEp.servers = resolved.servers;
-            episodeMap.set(targetEp.url, targetEp);
-            console.log(`  ⚡ تم صيد رابط مباشر للحلقة (${targetEp.episode_number || targetEp.title})`);
-          }
-          await new Promise(r => setTimeout(r, 400));
+      for (const targetEp of unstreamedEps) {
+        console.log(`🎬 [جلب رابط المشاهدة للحلقة ${targetEp.episode_number || targetEp.title}]...`);
+        const resolved = await resolveEpisodeStreamSafe(browser, targetEp.url, detailUrl);
+        if (resolved.stream_url) {
+          targetEp.stream_url = resolved.stream_url;
+          targetEp.servers = resolved.servers;
+          episodeMap.set(targetEp.url, targetEp);
+          console.log(`  ⚡ تم صيد الرابط بنجاح!`);
         }
       }
     }
@@ -545,7 +534,6 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
     });
     const hasEpisodes = mergedEpisodes.length > 0;
 
-    // رابط العرض الرئيسي للعمل ككل (أول رابط متاح)
     const masterStreamUrl = directPlayUrl || mergedEpisodes.find(e => e.stream_url)?.stream_url || finalServers[0]?.url || detailUrl;
 
     await db('contents?on_conflict=page_url', {
@@ -587,8 +575,7 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
     }
 
     const streamedCount = mergedEpisodes.filter(e => e.stream_url).length;
-    console.log(`✅ تم الحفظ: ${finalTitle} | بوستر: ${finalPoster ? 'متوفر' : 'غير متوفر'} | إجمالي الحلقات: ${mergedEpisodes.length} (جاهزة للبث المباشر: ${streamedCount})`);
-    await itemTab.close().catch(() => {});
+    console.log(`✅ تم الحفظ: ${finalTitle} | بوستر: ${finalPoster ? 'متوفر' : 'غير متوفر'} | إجمالي الحلقات: ${mergedEpisodes.length} (جاهزة للبث: ${streamedCount})`);
     return true;
 
   } catch (err) {
@@ -626,7 +613,13 @@ async function run() {
 
   const browser = await puppeteer.launch({
     headless: 'new',
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--window-size=1920,1080']
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--window-size=1920,1080'
+    ]
   });
 
   // 1. معالجة المهام الفاشلة مسبقاً
@@ -805,7 +798,7 @@ async function run() {
   for (const item of filteredItems) {
     console.log(`🔍 بدء فحص: ${item.title}`);
     await scrapeSingleItem(browser, item, targetUrl, target.category, target.type, processedSeriesCache);
-    await new Promise(r => setTimeout(r, 600));
+    await new Promise(r => setTimeout(r, 500));
   }
 
   await browser.close();
