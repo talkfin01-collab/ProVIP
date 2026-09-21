@@ -160,17 +160,18 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
       });
     } catch (e) {}
 
-    await itemTab.waitForSelector('.EpisodesList a, .Seasons--Episodes, .List--Episodes', { timeout: 3500 }).catch(() => {});
-    await new Promise(r => setTimeout(r, 1500));
+    await itemTab.waitForSelector('.EpisodesList a, .Seasons--Episodes, .List--Episodes, .Episodes--List', { timeout: 3500 }).catch(() => {});
+    await new Promise(r => setTimeout(r, 1200));
 
-    const pageDetails = await itemTab.evaluate(() => {
+    let pageDetails = await itemTab.evaluate(() => {
       // 1. استخراج رابط وهوية المسلسل الرئيسية إن وجد
       let seriesTitle = null;
       let seriesUrl = null;
       
       const seriesAnchor = document.querySelector('.Terms--Content--Single-begin li a[href*="/series/"]') ||
                            document.querySelector('.Series--Section > a[href*="/series/"]') ||
-                           document.querySelector('a.series--name');
+                           document.querySelector('a.series--name') ||
+                           document.querySelector('a[href*="/series/"]');
       if (seriesAnchor) {
         seriesTitle = seriesAnchor.innerText.trim();
         seriesUrl = seriesAnchor.getAttribute('href');
@@ -250,10 +251,10 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
         if (txt && !genres.includes(txt)) genres.push(txt);
       });
 
-      // 7. استخراج قائمة الحلقات بالكامل من داخل الصفحة
+      // 7. استخراج قائمة الحلقات (فحص شامل لكافة الحاويات الممكنة)
       const episodesList = [];
       const epElements = document.querySelectorAll(
-        '.EpisodesList a, .Seasons--Episodes .EpisodesList a, .List--Episodes a, .Episodes--Seasons--Episodes a, a[href*="/episode/"], a[href*="/watch/"]'
+        '.EpisodesList a, .Episodes--List a, .Seasons--Episodes .EpisodesList a, .List--Episodes a, .Singles--Episodes a, .Episodes--Seasons--Episodes a, a[href*="/episode/"], a[href*="/watch/"]'
       );
       
       const seenEps = new Set();
@@ -261,10 +262,10 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
         const href = a.getAttribute('href');
         if (!href || href.startsWith('#') || href.includes('javascript:') || seenEps.has(href)) return;
 
-        const titleEl = a.querySelector('episodetitle') || a;
+        const titleEl = a.querySelector('episodetitle') || a.querySelector('span') || a;
         const epTitle = titleEl.innerText.trim();
         
-        if (href.includes('حلقة') || href.includes('الحلقة') || href.includes('/watch/') || epTitle.includes('حلقة')) {
+        if (href.includes('حلقة') || href.includes('الحلقة') || href.includes('/watch/') || epTitle.includes('حلقة') || epTitle.includes('الحلقة')) {
           seenEps.add(href);
           const numMatch = epTitle.match(/(\d+)/);
           episodesList.push({
@@ -304,11 +305,49 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
       };
     });
 
+    const isSeriesItem = targetType === 'series' || item.isSeries || pageDetails.seriesTitle !== null;
+
+    // القفز الذكي: إذا كان مسلسلاً وخرج بـ 0 حلقة ولديه رابط صفحة المسلسل الرئيسي، ننتقل فوراً لصفحة المسلسل الأصلية لجلب الحلقات
+    if (isSeriesItem && pageDetails.episodesList.length === 0 && pageDetails.seriesUrl) {
+      try {
+        console.log(`🚀 [القفز لصفحة المسلسل الأم]: جلب الحلقات كاملة من ${pageDetails.seriesUrl}`);
+        const fullSeriesUrl = pageDetails.seriesUrl.startsWith('http') ? pageDetails.seriesUrl : `${PRIMARY_DOMAIN}${pageDetails.seriesUrl}`;
+        await safeNavigate(itemTab, fullSeriesUrl, detailUrl);
+        await itemTab.waitForSelector('.EpisodesList a, .List--Episodes, .Episodes--List', { timeout: 3500 }).catch(() => {});
+
+        const extraEpisodes = await itemTab.evaluate(() => {
+          const list = [];
+          const seen = new Set();
+          document.querySelectorAll('.EpisodesList a, .Episodes--List a, .List--Episodes a, .Episodes--Seasons--Episodes a, a[href*="/episode/"], a[href*="/watch/"]').forEach(a => {
+            const href = a.getAttribute('href');
+            if (!href || href.startsWith('#') || href.includes('javascript:') || seen.has(href)) return;
+            const titleEl = a.querySelector('episodetitle') || a.querySelector('span') || a;
+            const epTitle = titleEl.innerText.trim();
+            if (href.includes('حلقة') || href.includes('الحلقة') || href.includes('/watch/') || epTitle.includes('حلقة') || epTitle.includes('الحلقة')) {
+              seen.add(href);
+              const numMatch = epTitle.match(/(\d+)/);
+              list.push({
+                title: epTitle || 'حلقة',
+                url: href,
+                episode_number: numMatch ? parseInt(numMatch[1], 10) : null
+              });
+            }
+          });
+          return list;
+        });
+
+        if (extraEpisodes && extraEpisodes.length > 0) {
+          pageDetails.episodesList = extraEpisodes;
+          console.log(`✨ تم استخراج ${extraEpisodes.length} حلقة بنجاح من صفحة المسلسل الأم!`);
+        }
+      } catch (err) {
+        console.log('ملاحظة أثناء استخراج صفحة المسلسل الأم:', err.message);
+      }
+    }
+
     itemTab.off('request', networkSniffer);
 
-    const isSeriesItem = targetType === 'series' || item.isSeries || pageDetails.seriesTitle !== null;
     const contentType = isSeriesItem ? 'series' : targetType;
-
     const baseTitle = extractBaseTitle(pageDetails.seriesTitle || item.title);
     const seriesKey = pageDetails.seriesUrl || (isSeriesItem ? baseTitle : item.path);
 
