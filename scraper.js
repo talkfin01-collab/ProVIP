@@ -110,6 +110,7 @@ function extractBaseTitle(rawTitle) {
     .replace(/\s*الحلقة\s+\d+/gi, '')
     .replace(/\s*الحلقة\s+[\u0621-\u064A]+/gi, '')
     .replace(/\s*حلقة\s+\d+/gi, '')
+    .replace(/\s*والاخيرة/gi, '')
     .replace(/\s*\(\s*\d{4}\s*\)\s*$/g, '')
     .trim();
 }
@@ -159,8 +160,7 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
       });
     } catch (e) {}
 
-    // انتظار تحميل قائمة الحلقات إن وجدت
-    await itemTab.waitForSelector('.EpisodesList a, .Seasons--Episodes', { timeout: 3500 }).catch(() => {});
+    await itemTab.waitForSelector('.EpisodesList a, .Seasons--Episodes, .List--Episodes', { timeout: 3500 }).catch(() => {});
     await new Promise(r => setTimeout(r, 1500));
 
     const pageDetails = await itemTab.evaluate(() => {
@@ -169,13 +169,14 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
       let seriesUrl = null;
       
       const seriesAnchor = document.querySelector('.Terms--Content--Single-begin li a[href*="/series/"]') ||
-                           document.querySelector('.Series--Section > a[href*="/series/"]');
+                           document.querySelector('.Series--Section > a[href*="/series/"]') ||
+                           document.querySelector('a.series--name');
       if (seriesAnchor) {
         seriesTitle = seriesAnchor.innerText.trim();
         seriesUrl = seriesAnchor.getAttribute('href');
       }
 
-      // 2. استخراج البوستر المباشر
+      // 2. استخراج البوستر المباشر الشامل (دعم Meta و JSON-LD و CSS)
       let poster = '';
       const metaOgImage = document.querySelector('meta[property="og:image"]');
       const metaTwImage = document.querySelector('meta[name="twitter:image"]');
@@ -187,15 +188,30 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
       }
 
       if (!poster) {
-        const wecimaEl = document.querySelector('wecima');
-        if (wecimaEl && wecimaEl.getAttribute('style')) {
-          const m = wecimaEl.getAttribute('style').match(/--img:\s*url\(([^)]+)\)/i);
+        try {
+          const schemaEl = document.querySelector('script.yoast-schema-graph, script[type="application/ld+json"]');
+          if (schemaEl) {
+            const schemaData = JSON.parse(schemaEl.innerText);
+            const graph = schemaData['@graph'] || [schemaData];
+            for (const node of graph) {
+              if (node.thumbnailUrl) { poster = node.thumbnailUrl; break; }
+              if (node.image && node.image.url) { poster = node.image.url; break; }
+            }
+          }
+        } catch (e) {}
+      }
+
+      if (!poster) {
+        const wecimaEl = document.querySelector('wecima, .wecima--single--poster, .Poster--Single-begin');
+        if (wecimaEl) {
+          const rawStyle = wecimaEl.getAttribute('style') || '';
+          const m = rawStyle.match(/--img:\s*url\(([^)]+)\)/i) || rawStyle.match(/url\(['"]?([^'")]+)['"]?\)/i);
           if (m) poster = m[1].replace(/['"]/g, '');
         }
       }
 
       if (!poster) {
-        const imgEl = document.querySelector('.Poster--Single-begin img, .wecima--single--poster img, [itemprop="image"]');
+        const imgEl = document.querySelector('.Poster--Single-begin img, .wecima--single--poster img, [itemprop="image"], .Poster--Single img');
         if (imgEl) {
           poster = imgEl.getAttribute('data-src') || imgEl.getAttribute('data-lazy-src') || imgEl.src || '';
         }
@@ -236,16 +252,23 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
 
       // 7. استخراج قائمة الحلقات بالكامل من داخل الصفحة
       const episodesList = [];
-      const epElements = document.querySelectorAll('.EpisodesList a, .Seasons--Episodes .EpisodesList a, a[href*="/episode/"]');
+      const epElements = document.querySelectorAll(
+        '.EpisodesList a, .Seasons--Episodes .EpisodesList a, .List--Episodes a, .Episodes--Seasons--Episodes a, a[href*="/episode/"], a[href*="/watch/"]'
+      );
       
+      const seenEps = new Set();
       epElements.forEach(a => {
         const href = a.getAttribute('href');
+        if (!href || href.startsWith('#') || href.includes('javascript:') || seenEps.has(href)) return;
+
         const titleEl = a.querySelector('episodetitle') || a;
         const epTitle = titleEl.innerText.trim();
-        const numMatch = epTitle.match(/(\d+)/);
-        if (href) {
+        
+        if (href.includes('حلقة') || href.includes('الحلقة') || href.includes('/watch/') || epTitle.includes('حلقة')) {
+          seenEps.add(href);
+          const numMatch = epTitle.match(/(\d+)/);
           episodesList.push({
-            title: epTitle,
+            title: epTitle || 'حلقة',
             url: href,
             episode_number: numMatch ? parseInt(numMatch[1], 10) : null
           });
@@ -289,7 +312,6 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
     const baseTitle = extractBaseTitle(pageDetails.seriesTitle || item.title);
     const seriesKey = pageDetails.seriesUrl || (isSeriesItem ? baseTitle : item.path);
 
-    // إذا تم تأكيد اكتمال وحفظ المسلسل سابقاً مع حلقاته، نتخطاه فوراً
     if (isSeriesItem && processedSeriesKeys.has(seriesKey)) {
       console.log(`⏩ [تخطي تكرار مؤكد]: تم فحص المسلسل وحفظ شجرته مسبقاً (${baseTitle})`);
       await itemTab.close().catch(() => {});
@@ -345,7 +367,6 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
       }])
     });
 
-    // لا نقفل المسلسل لمنع تكراره إلا إذا تم بالفعل استخراج حلقاته بنجاح
     if (isSeriesItem && hasEpisodes) {
       if (seriesKey) processedSeriesKeys.add(seriesKey);
       processedSeriesKeys.add(baseTitle);
@@ -473,7 +494,7 @@ async function run() {
 
   console.log(`✨ عناصر فريدة للتنفيذ بعد فلترة التكرار: ${filteredItems.length} (تم استبعاد ${items.length - filteredItems.length} مكرر).`);
 
-  // معالجة الصفحة بالكامل (معالجة كافة العناصر المستخرجة دون الاقتصار على 10 عناصر)
+  // معالجة الصفحة بالكامل دون تقييد بـ 10 عناصر
   for (const item of filteredItems) {
     console.log(`🔍 بدء فحص: ${item.title}`);
     await scrapeSingleItem(browser, item, targetUrl, target.category, target.type, processedSeriesKeys);
