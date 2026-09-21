@@ -28,7 +28,7 @@ const CATEGORY_ORDER = [
   { path: '/category/%d9%85%d8%b3%d9%84%d8%b3%d9%84%d8%a7%d8%aa-%d9%87%d9%86%d8%af%d9%8a%d8%a9/', category: 'series_indian', type: 'series' },
   { path: '/category/%d9%85%d8%b3%d9%84%d8%b3%d9%84%d8%a7%d8%aa-%d8%a7%d9%86%d9%85%d9%8a/', category: 'series_anime', type: 'series' },
   { path: '/category/%d9%85%d8%b3%d9%84%d8%b3%d9%84%d8%a7%d8%aa-%d9%85%d8%af%d8%a8%d9%84%d8%ac%d8%a9/', category: 'series_dubbed', type: 'series' },
-  { path: '/category/%d8%a8%d8%b1%d8%a7%d9%85%d8%ac-%d8%aa%d9%84%d9%81%d8%b2%d9%8a%d9%88%d9%86%d9%8a%d8%a9/', category: 'tv_shows', type: 'series' },
+  { path: '/category/%d8%a8%d8%b1%d8%a7%d9%85%d8%ac-%d8%aa%d9%84%d9%81%d8%b2%d9%8a%d9%86%d9%8a%d8%a9/', category: 'tv_shows', type: 'series' },
   { path: '/category/%d8%b9%d8%b1%d9%88%d8%b6-%d9%85%d8%b5%d8%a7%d8%b1%d8%b9%d8%a9/', category: 'wrestling', type: 'wrestling' },
   { path: '/category/%d9%85%d8%b3%d8%b1%d8%ad%d9%8a%d8%a7%d8%aa-%d8%b9%d8%b1%d8%a8%d9%8a%d8%a9/', category: 'theater', type: 'theater' }
 ];
@@ -98,6 +98,7 @@ async function safeNavigate(page, url, referer = '') {
   return title;
 }
 
+// دالة تطهير وتنقية شاملة تزيل الأرقام المعطوفة والمركبة بالكامل
 function extractBaseTitle(rawTitle) {
   let clean = rawTitle
     .replace(/^مشاهدة\s+/i, '')
@@ -110,19 +111,26 @@ function extractBaseTitle(rawTitle) {
     .replace(/\s*مدبلجة?/gi, '')
     .replace(/\s*الموسم\s+([^\s]+)/gi, '')
     .replace(/\s*الحلقة\s+\d+/gi, '')
-    .replace(/\s*الحلقة\s+[\u0621-\u064A]+/gi, '')
-    .replace(/\s*(الاولى|الثانية|الثالثة|الرابعة|الخامسة|السادسة|السابعة|الثامنة|التاسعة|العاشرة|الحادية عشر|الثانية عشر|الثالثة عشر|الرابعة عشر|الخامسة عشر|السادسة عشر|السابعة عشر|الثامنة عشر|التاسعة عشر|العشرون|والاخيرة|الاخيرة)/gi, '')
     .replace(/\s*حلقة\s+\d+/gi, '')
+    // 1. حذف الأرقام المعطوفة المركبة مثل (الحادية والثلاثون، الخامسة والعشرون، إلخ)
+    .replace(/\s*(الحادية|الثانية|الثالثة|الرابعة|الخامسة|السادسة|السابعة|الثامنة|التاسعة)\s+و\s*(العشرون|الثلاثون|الاربعون|الخمسون)/gi, '')
+    // 2. حذف الأعداد المركبة مثل (الخامسة عشر، الحادية عشر، إلخ)
+    .replace(/\s*(الحادية|الثانية|الثالثة|الرابعة|الخامسة|السادسة|السابعة|الثامنة|التاسعة)\s+عشر/gi, '')
+    // 3. حذف الأعداد الترتيبية المفردة والعقود
+    .replace(/\s*(الاولى|الثانية|الثالثة|الرابعة|الخامسة|السادسة|السابعة|الثامنة|التاسعة|العاشرة|العشرون|الثلاثون|الاربعون|الخمسون|عشر)/gi, '')
+    .replace(/\s*(والاخيرة|الاخيرة)/gi, '')
     .trim();
 
+  // إزالة تكرار السنوات المزدوجة والمفردة
   clean = clean.replace(/(\(\s*\d{4}\s*\)\s*)+$/g, '').trim();
   clean = clean.replace(/\s*\b(19\d\d|20\d\d)\b\s*$/g, '').trim();
-  clean = clean.replace(/\s*اون\b/gi, '').trim();
+  // إزالة أي حرف عطف يتيم متبقي في نهاية العنوان
+  clean = clean.replace(/\s+و$/gi, '').trim();
 
   return clean;
 }
 
-// دالة مساعدة لاستخراج الحلقات من أي صفحة
+// دالة مساعدة لاستخراج الحلقات من الصفحة
 async function extractEpisodesFromPage(pageTab) {
   return await pageTab.evaluate(() => {
     const list = [];
@@ -146,7 +154,7 @@ async function extractEpisodesFromPage(pageTab) {
   });
 }
 
-// مطابقة واستخراج كافة المواسم غير النشطة بنظام الدفعات (Reconcile Seasons)
+// مطابقة واستخراج كافة المواسم غير النشطة
 async function reconcileOtherSeasons(itemTab, seasonsList, currentUrl, baseEpisodeMap) {
   if (!seasonsList || seasonsList.length <= 1) return;
 
@@ -155,7 +163,6 @@ async function reconcileOtherSeasons(itemTab, seasonsList, currentUrl, baseEpiso
 
   console.log(`🧭 [تسوية المواسم]: تم رصد ${seasonsToFetch.length} مواسم إضافية، جاري فحص الحلقات...`);
 
-  // فحص بنظام دفعات (CHUNK_SIZE = 3 لضمان استقرار Puppeteer)
   const CHUNK_SIZE = 3;
   for (let i = 0; i < seasonsToFetch.length; i += CHUNK_SIZE) {
     const chunk = seasonsToFetch.slice(i, i + CHUNK_SIZE);
@@ -369,7 +376,6 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
 
     const isSeriesItem = targetType === 'series' || item.isSeries || pageDetails.seriesTitle !== null;
 
-    // القفز لصفحة المسلسل الأصلية إذا كان مسلسلاً وخرج بصفر حلقة
     if (isSeriesItem && pageDetails.episodesList.length === 0 && pageDetails.seriesUrl) {
       try {
         console.log(`🚀 [القفز لصفحة المسلسل الأصلية]: ${pageDetails.seriesUrl}`);
@@ -386,9 +392,6 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
       }
     }
 
-    // -------------------------------------------------------------------
-    // دمج الحلقات وتفعيل آلية تسوية المواسم المتعددة (Reconcile Seasons)
-    // -------------------------------------------------------------------
     const baseTitle = extractBaseTitle(pageDetails.seriesTitle || item.title);
     const existingSeriesRecord = processedSeriesCache.get(baseTitle);
 
@@ -410,7 +413,6 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
       if (!episodeMap.has(ep.url)) episodeMap.set(ep.url, ep);
     }
 
-    // زيارة المواسم الأخرى ومطابقتها إذا كان مسلسلاً
     if (isSeriesItem && pageDetails.seasonsList && pageDetails.seasonsList.length > 1) {
       await reconcileOtherSeasons(itemTab, pageDetails.seasonsList, detailUrl, episodeMap);
     }
@@ -485,7 +487,6 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
     console.log(`⚠️ فشل فحص (${item.title}): ${err.message}`);
     await itemTab.close().catch(() => {});
 
-    // تسجيل الصفحة الفاشلة في جدول failed_jobs لإعادة المحاولة لاحقاً
     try {
       await db('failed_jobs', {
         method: 'POST',
@@ -520,9 +521,7 @@ async function run() {
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--window-size=1920,1080']
   });
 
-  // -------------------------------------------------------------
-  // 1. فحص وإعادة محاولة الوظائف الفاشلة أولاً (failed_jobs)
-  // -------------------------------------------------------------
+  // 1. معالجة المهام الفاشلة مسبقاً
   try {
     const failedJobs = await db('failed_jobs?retry_count=lt.3&order=id.asc&limit=3');
     if (failedJobs && failedJobs.length > 0) {
@@ -546,9 +545,7 @@ async function run() {
     console.log('ملاحظة أثناء فحص failed_jobs:', e.message);
   }
 
-  // -------------------------------------------------------------
   // 2. إكمال دورة الكشط الطبيعية
-  // -------------------------------------------------------------
   let targetIndex = (state.target_index || 0) % CATEGORY_ORDER.length;
   let page = state.current_page || 1;
   const isArchiveDone = state.initial_archive_done === 1;
