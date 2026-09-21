@@ -98,7 +98,6 @@ async function safeNavigate(page, url, referer = '') {
   return title;
 }
 
-// دالة تنظيف وتجريد العناوين لاستخراج هوية العمل الأصلية
 function extractBaseTitle(rawTitle) {
   return rawTitle
     .replace(/^مشاهدة\s+/i, '')
@@ -153,7 +152,6 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
     const detailUrl = `${PRIMARY_DOMAIN}${item.path}`;
     await safeNavigate(itemTab, detailUrl, refererUrl);
 
-    // محاولة النقر على زر السيرفر بهدوء لتنشيط استخراج الرابط
     try {
       await itemTab.evaluate(() => {
         const btn = document.querySelector('ul#watch li:first-child, .WatchServersList li:first-child, .Watch--Btn, .btn--watch');
@@ -161,8 +159,8 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
       });
     } catch (e) {}
 
-    // انتظار تحميل قسم الحلقات إذا وُجد في الصفحة
-    await itemTab.waitForSelector('.EpisodesList a, .Seasons--Episodes', { timeout: 4000 }).catch(() => {});
+    // انتظار تحميل قائمة الحلقات إن وجدت
+    await itemTab.waitForSelector('.EpisodesList a, .Seasons--Episodes', { timeout: 3500 }).catch(() => {});
     await new Promise(r => setTimeout(r, 1500));
 
     const pageDetails = await itemTab.evaluate(() => {
@@ -236,7 +234,7 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
         if (txt && !genres.includes(txt)) genres.push(txt);
       });
 
-      // 7. استخراج قائمة الحلقات (فحص دقيق لكافة الحاويات المحتملة)
+      // 7. استخراج قائمة الحلقات بالكامل من داخل الصفحة
       const episodesList = [];
       const epElements = document.querySelectorAll('.EpisodesList a, .Seasons--Episodes .EpisodesList a, a[href*="/episode/"]');
       
@@ -288,10 +286,10 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
     const isSeriesItem = targetType === 'series' || item.isSeries || pageDetails.seriesTitle !== null;
     const contentType = isSeriesItem ? 'series' : targetType;
 
-    // تحديد المفتاح الأساسي لمنع التكرار
     const baseTitle = extractBaseTitle(pageDetails.seriesTitle || item.title);
     const seriesKey = pageDetails.seriesUrl || (isSeriesItem ? baseTitle : item.path);
 
+    // إذا تم تأكيد اكتمال وحفظ المسلسل سابقاً مع حلقاته، نتخطاه فوراً
     if (isSeriesItem && processedSeriesKeys.has(seriesKey)) {
       console.log(`⏩ [تخطي تكرار مؤكد]: تم فحص المسلسل وحفظ شجرته مسبقاً (${baseTitle})`);
       await itemTab.close().catch(() => {});
@@ -313,10 +311,9 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
     let finalPoster = pageDetails.poster || item.poster || '';
     if (finalPoster.startsWith('//')) finalPoster = 'https:' + finalPoster;
 
-    // العنوان المعتمد
     const finalTitle = isSeriesItem ? baseTitle : extractBaseTitle(item.title);
-    // الرابط المعتمد كسجل أساسي في قاعدة البيانات
     const finalPageUrl = isSeriesItem && pageDetails.seriesUrl ? pageDetails.seriesUrl : item.path;
+    const hasEpisodes = pageDetails.episodesList && pageDetails.episodesList.length > 0;
 
     await db('contents?on_conflict=page_url', {
       method: 'POST',
@@ -341,15 +338,16 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
           season_name: pageDetails.seasonName || null,
           episode_number: pageDetails.episodeNumber || null,
           seasons: pageDetails.seasonsList.length > 0 ? pageDetails.seasonsList : undefined,
-          episodes: pageDetails.episodesList.length > 0 ? pageDetails.episodesList : undefined,
+          episodes: hasEpisodes ? pageDetails.episodesList : undefined,
           status: 'success'
         },
         updated_at: new Date().toISOString()
       }])
     });
 
-    if (isSeriesItem) {
-      processedSeriesKeys.add(seriesKey);
+    // لا نقفل المسلسل لمنع تكراره إلا إذا تم بالفعل استخراج حلقاته بنجاح
+    if (isSeriesItem && hasEpisodes) {
+      if (seriesKey) processedSeriesKeys.add(seriesKey);
       processedSeriesKeys.add(baseTitle);
     }
 
@@ -365,7 +363,7 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
 }
 
 async function run() {
-  console.log('🚀 بدء تشغيل الكاشط الذكي (تجريد العناوين + منع تكرار المسلسلات + جلب البوسترات)...');
+  console.log('🚀 بدء تشغيل الكاشط الشامل (معالجة الصفحة كاملة + البوسترات + شجرة الحلقات)...');
 
   let state = (await db('scraper_state?id=eq.1&select=*'))?.[0];
   if (!state) {
@@ -396,7 +394,7 @@ async function run() {
   await safeNavigate(mainTab, `${PRIMARY_DOMAIN}/`);
   await safeNavigate(mainTab, targetUrl, `${PRIMARY_DOMAIN}/`);
 
-  // استخراج البطاقات
+  // استخراج جميع البطاقات من واجهة القسم
   const rawItems = await mainTab.evaluate(() => {
     const list = [];
     document.querySelectorAll('.Thumb--GridItem').forEach(el => {
@@ -445,10 +443,10 @@ async function run() {
   const items = Array.from(uniqueMap.values());
   console.log(`📦 العناصر المستخرجة من الصفحة: ${items.length} عنصر.`);
 
-  // فحص قاعدة البيانات لتخطي ما تم حفظه مسبقاً
+  // استرجاع أحدث العناوين المسجلة من قاعدة البيانات لتفادي تكرار المسلسلات
   const processedSeriesKeys = new Set();
   try {
-    const existingTitles = await db(`contents?select=title&limit=200&order=id.desc`);
+    const existingTitles = await db(`contents?select=title&limit=250&order=id.desc`);
     if (existingTitles && existingTitles.length > 0) {
       existingTitles.forEach(r => {
         if (r.title) processedSeriesKeys.add(r.title);
@@ -458,7 +456,7 @@ async function run() {
     console.log('ملاحظة أثناء استرجاع العناوين المسجلة مسبقاً:', e.message);
   }
 
-  // فلترة العناصر المكررة في نفس قائمة الصفحة قبل البدء
+  // فلترة العناصر المكررة في نفس قائمة الصفحة
   const filteredItems = [];
   const seenPageBaseTitles = new Set();
 
@@ -466,7 +464,7 @@ async function run() {
     const base = extractBaseTitle(item.title);
     if (item.isSeries) {
       if (seenPageBaseTitles.has(base) || processedSeriesKeys.has(base)) {
-        continue; // تخطي التكرار فورا بدون فتح التبويب
+        continue;
       }
       seenPageBaseTitles.add(base);
     }
@@ -475,7 +473,8 @@ async function run() {
 
   console.log(`✨ عناصر فريدة للتنفيذ بعد فلترة التكرار: ${filteredItems.length} (تم استبعاد ${items.length - filteredItems.length} مكرر).`);
 
-  for (const item of filteredItems.slice(0, 10)) {
+  // معالجة الصفحة بالكامل (معالجة كافة العناصر المستخرجة دون الاقتصار على 10 عناصر)
+  for (const item of filteredItems) {
     console.log(`🔍 بدء فحص: ${item.title}`);
     await scrapeSingleItem(browser, item, targetUrl, target.category, target.type, processedSeriesKeys);
     await new Promise(r => setTimeout(r, 600));
@@ -483,11 +482,13 @@ async function run() {
 
   await browser.close();
 
+  // تدوير الأقسام والصفحات
   let nextIndex = targetIndex + 1;
   let nextPage = page;
   if (nextIndex >= CATEGORY_ORDER.length) {
     nextIndex = 0;
     nextPage = page + 1;
+    console.log(`🏁 اكتملت دورة الصفحة (${page}) لجميع الأقسام الـ 18. الانتقال للصفحة (${nextPage})...`);
   }
   if (nextPage > 50) nextPage = 1;
 
