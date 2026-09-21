@@ -147,6 +147,77 @@ async function extractEpisodesFromPage(pageTab) {
   });
 }
 
+// دالة سريعة لصيد رابط الفيديو المباشر والسيرفرات لحلقة محددة
+async function resolveEpisodeStream(browser, epUrl, refererUrl) {
+  const epTab = await browser.newPage();
+  await epTab.setViewport({ width: 1280, height: 720 });
+  await epTab.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36');
+  await epTab.setRequestInterception(true);
+
+  let directStream = '';
+  const embeds = [];
+  const seenEmbeds = new Set();
+
+  epTab.on('request', (req) => {
+    const u = req.url();
+    const resType = req.resourceType();
+
+    if (u.includes('govid.live/video-') || u.includes('govid.live/play/') || u.includes('.m3u8') || u.includes('.mp4')) {
+      if (!directStream) directStream = u;
+    } else if (u.includes('govid.live/e/') || (u.includes('embed') && !u.includes('google') && !u.includes('doubleclick'))) {
+      if (!seenEmbeds.has(u)) {
+        seenEmbeds.add(u);
+        embeds.push({ name: 'مشغل مدمج (govid)', url: u });
+      }
+    }
+
+    if (resType === 'font' || resType === 'image' || (resType === 'media' && !u.includes('govid'))) {
+      req.abort();
+    } else {
+      req.continue();
+    }
+  });
+
+  try {
+    const fullUrl = epUrl.startsWith('http') ? epUrl : `${PRIMARY_DOMAIN}${epUrl}`;
+    await safeNavigate(epTab, fullUrl, refererUrl);
+
+    try {
+      await epTab.evaluate(() => {
+        const btn = document.querySelector('ul#watch li:first-child, .WatchServersList li:first-child, .Watch--Btn, .btn--watch');
+        if (btn) btn.click();
+      });
+    } catch (e) {}
+
+    await new Promise(r => setTimeout(r, 1200));
+
+    const domServers = await epTab.evaluate(() => {
+      const list = [];
+      document.querySelectorAll('ul#watch li, .WatchServersList li, [data-watch]').forEach(li => {
+        let url = li.getAttribute('data-watch') || li.getAttribute('data-url');
+        const name = li.innerText.trim() || 'سيرفر مشاهدة';
+        if (url && !url.startsWith('#') && !url.startsWith('javascript:')) {
+          if (url.startsWith('//')) url = 'https:' + url;
+          list.push({ name, url });
+        }
+      });
+      return list;
+    });
+
+    const allServers = [...embeds, ...domServers];
+    if (directStream) allServers.unshift({ name: 'بث مباشر رئيسي (Direct)', url: directStream });
+
+    await epTab.close().catch(() => {});
+    return {
+      stream_url: directStream || allServers[0]?.url || null,
+      servers: allServers
+    };
+  } catch (err) {
+    await epTab.close().catch(() => {});
+    return { stream_url: null, servers: [] };
+  }
+}
+
 async function reconcileOtherSeasons(itemTab, seasonsList, currentUrl, baseEpisodeMap) {
   if (!seasonsList || seasonsList.length <= 1) return;
 
@@ -400,27 +471,6 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
       existingSeriesRecord.extra_data.episodes.forEach(ep => episodeMap.set(ep.url, ep));
     }
 
-    if (pageDetails.episodeNumber) {
-      episodeMap.set(item.path, {
-        title: `الحلقة ${pageDetails.episodeNumber}`,
-        url: item.path,
-        episode_number: pageDetails.episodeNumber,
-        servers: capturedEmbeds
-      });
-    }
-
-    for (const ep of pageDetails.episodesList) {
-      if (!episodeMap.has(ep.url)) episodeMap.set(ep.url, ep);
-    }
-
-    if (isSeriesItem && pageDetails.seasonsList && pageDetails.seasonsList.length > 1) {
-      await reconcileOtherSeasons(itemTab, pageDetails.seasonsList, detailUrl, episodeMap);
-    }
-
-    const contentType = isSeriesItem ? 'series' : targetType;
-    const finalTitle = isSeriesItem ? baseTitle : `${baseTitle} (${item.year})`;
-    const finalPageUrl = isSeriesItem && pageDetails.seriesUrl ? pageDetails.seriesUrl : item.path;
-
     const allServers = [...capturedEmbeds, ...pageDetails.domServers];
     if (directPlayUrl) allServers.unshift({ name: 'بث مباشر رئيسي (Direct)', url: directPlayUrl });
 
@@ -433,6 +483,60 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
       }
     }
 
+    // 1. تسجيل الحلقة الحالية مع رابط البث المباشر الصريح وسيرفراتها
+    if (pageDetails.episodeNumber) {
+      const currentStream = directPlayUrl || finalServers[0]?.url || null;
+      episodeMap.set(item.path, {
+        title: `الحلقة ${pageDetails.episodeNumber}`,
+        url: item.path,
+        stream_url: currentStream,
+        episode_number: pageDetails.episodeNumber,
+        servers: finalServers
+      });
+    }
+
+    // 2. دمج الحلقات الأخرى المكتشفة في الصفحة مع الحفاظ على ما تم صيده سابقاً
+    for (const ep of pageDetails.episodesList) {
+      if (!episodeMap.has(ep.url)) {
+        episodeMap.set(ep.url, {
+          title: ep.title,
+          url: ep.url,
+          stream_url: null,
+          episode_number: ep.episode_number,
+          servers: []
+        });
+      }
+    }
+
+    if (isSeriesItem && pageDetails.seasonsList && pageDetails.seasonsList.length > 1) {
+      await reconcileOtherSeasons(itemTab, pageDetails.seasonsList, detailUrl, episodeMap);
+    }
+
+    // 3. فحص الحلقات التي ينقصها رابط بث مباشر (أحدث 3 حلقات لتفادي إطالة وقت التنفيذ)
+    if (isSeriesItem) {
+      const unstreamedEps = Array.from(episodeMap.values())
+        .filter(ep => !ep.stream_url && ep.url && ep.url !== item.path)
+        .slice(-3); // فحص أحدث 3 حلقات فقط لضمان سرعة الكاشط وتوفير الرابط فوراً
+
+      if (unstreamedEps.length > 0) {
+        console.log(`🎬 [جلب روابط المشاهدة المباشرة]: فحص ${unstreamedEps.length} حلقات إضافية لمسلسل (${baseTitle})...`);
+        for (const targetEp of unstreamedEps) {
+          const resolved = await resolveEpisodeStream(browser, targetEp.url, detailUrl);
+          if (resolved.stream_url) {
+            targetEp.stream_url = resolved.stream_url;
+            targetEp.servers = resolved.servers;
+            episodeMap.set(targetEp.url, targetEp);
+            console.log(`  ⚡ تم صيد رابط مباشر للحلقة (${targetEp.episode_number || targetEp.title})`);
+          }
+          await new Promise(r => setTimeout(r, 400));
+        }
+      }
+    }
+
+    const contentType = isSeriesItem ? 'series' : targetType;
+    const finalTitle = isSeriesItem ? baseTitle : `${baseTitle} (${item.year})`;
+    const finalPageUrl = isSeriesItem && pageDetails.seriesUrl ? pageDetails.seriesUrl : item.path;
+
     let finalPoster = pageDetails.poster || item.poster || '';
     if (finalPoster.startsWith('//')) finalPoster = 'https:' + finalPoster;
 
@@ -440,6 +544,9 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
       return (a.episode_number || 0) - (b.episode_number || 0);
     });
     const hasEpisodes = mergedEpisodes.length > 0;
+
+    // رابط العرض الرئيسي للعمل ككل (أول رابط متاح)
+    const masterStreamUrl = directPlayUrl || mergedEpisodes.find(e => e.stream_url)?.stream_url || finalServers[0]?.url || detailUrl;
 
     await db('contents?on_conflict=page_url', {
       method: 'POST',
@@ -450,7 +557,7 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
         category: targetCategory,
         year: item.year,
         poster_url: finalPoster,
-        stream_url: directPlayUrl || finalServers[0]?.url || detailUrl,
+        stream_url: masterStreamUrl,
         page_url: finalPageUrl,
         extra_data: {
           original_title: item.title,
@@ -479,7 +586,8 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
       });
     }
 
-    console.log(`✅ تم الحفظ: ${finalTitle} | بوستر: ${finalPoster ? 'متوفر' : 'غير متوفر'} | حلقات: ${mergedEpisodes.length}`);
+    const streamedCount = mergedEpisodes.filter(e => e.stream_url).length;
+    console.log(`✅ تم الحفظ: ${finalTitle} | بوستر: ${finalPoster ? 'متوفر' : 'غير متوفر'} | إجمالي الحلقات: ${mergedEpisodes.length} (جاهزة للبث المباشر: ${streamedCount})`);
     await itemTab.close().catch(() => {});
     return true;
 
@@ -677,11 +785,11 @@ async function run() {
     if (item.isSeries) {
       const cached = processedSeriesCache.get(base);
       if (cached && cached.extra_data?.episodes) {
-        const episodeExists = cached.extra_data.episodes.some(ep => ep.url === item.path);
+        const episodeExists = cached.extra_data.episodes.some(ep => ep.url === item.path && ep.stream_url);
         if (episodeExists) {
           continue;
         } else {
-          console.log(`🔥 [رصد حلقة جديدة لمسلسل مسجل]: ${item.title}`);
+          console.log(`🔥 [رصد حلقة جديدة أو تحديث بث لمسلسل]: ${item.title}`);
         }
       }
       if (seenInCurrentPage.has(base)) {
