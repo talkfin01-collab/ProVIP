@@ -98,7 +98,6 @@ async function safeNavigate(page, url, referer = '') {
   return title;
 }
 
-// دالة متطورة لتنقية أسماء الأفلام والمسلسلات وتجريد التكرار تماماً
 function extractBaseTitle(rawTitle) {
   let clean = rawTitle
     .replace(/^مشاهدة\s+/i, '')
@@ -116,9 +115,10 @@ function extractBaseTitle(rawTitle) {
     .replace(/\s*حلقة\s+\d+/gi, '')
     .trim();
 
-  // إزالة تكرار السنوات المزدوجة مثل ( 1988 ) ( 1988 )
+  // إزالة تكرار السنوات المزدوجة والمفردة
   clean = clean.replace(/(\(\s*\d{4}\s*\)\s*)+$/g, '').trim();
   clean = clean.replace(/\s*\b(19\d\d|20\d\d)\b\s*$/g, '').trim();
+  clean = clean.replace(/\s*اون\b/gi, '').trim();
 
   return clean;
 }
