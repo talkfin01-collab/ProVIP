@@ -299,7 +299,6 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
 
     const isSeriesItem = targetType === 'series' || item.isSeries || pageDetails.seriesTitle !== null;
 
-    // القفز لصفحة المسلسل الأصلية إذا كان مسلسلاً وخرج بصفر حلقة
     if (isSeriesItem && pageDetails.episodesList.length === 0 && pageDetails.seriesUrl) {
       try {
         console.log(`🚀 [القفز لصفحة المسلسل الأصلية]: ${pageDetails.seriesUrl}`);
@@ -359,9 +358,6 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
     let finalPoster = pageDetails.poster || item.poster || '';
     if (finalPoster.startsWith('//')) finalPoster = 'https:' + finalPoster;
 
-    // -------------------------------------------------------------
-    // منطق دمج الحلقات الجديدة في حال كان المسلسل مسجلاً مسبقاً
-    // -------------------------------------------------------------
     let mergedEpisodes = pageDetails.episodesList || [];
     const existingSeriesRecord = processedSeriesCache.get(baseTitle);
 
@@ -370,7 +366,6 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
       const episodeMap = new Map();
       oldEpisodes.forEach(ep => episodeMap.set(ep.url, ep));
 
-      // إذا كانت الصفحة الحالية حلقة منفصلة وسيرفراتها متوفرة، نضمن وجودها
       if (pageDetails.episodeNumber) {
         episodeMap.set(item.path, {
           title: `الحلقة ${pageDetails.episodeNumber}`,
@@ -380,7 +375,6 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
         });
       }
 
-      // دمج أي حلقات مستخرجة جديدة مع القديمة
       for (const newEp of pageDetails.episodesList) {
         if (!episodeMap.has(newEp.url)) {
           episodeMap.set(newEp.url, newEp);
@@ -456,10 +450,9 @@ async function run() {
   let page = state.current_page || 1;
   const isArchiveDone = state.initial_archive_done === 1;
 
-  // إذا اكتمل كشط كامل الأرشيف، نتحول تلقائياً لوضع "المراقبة الحية" لصفحة البداية لرصد الجديد فوراً
   if (isArchiveDone) {
     page = 1;
-    console.log(`📡 [وضع المراقبة الحية للعروض الحديثة نشط]: جاري فحص أحدث التحديثات في القسم...`);
+    console.log(`📡 [وضع المراقبة الحية للعروض الحديثة نشط]: فحص التحديثات الحصرية أولاً بأول...`);
   }
 
   const target = CATEGORY_ORDER[targetIndex];
@@ -481,7 +474,6 @@ async function run() {
   await safeNavigate(mainTab, `${PRIMARY_DOMAIN}/`);
   await safeNavigate(mainTab, targetUrl, `${PRIMARY_DOMAIN}/`);
 
-  // استخراج البطاقات
   const rawItems = await mainTab.evaluate(() => {
     const list = [];
     document.querySelectorAll('.Thumb--GridItem').forEach(el => {
@@ -530,10 +522,24 @@ async function run() {
   const items = Array.from(uniqueMap.values());
   console.log(`📦 العناصر المستخرجة من الصفحة: ${items.length} عنصر.`);
 
-  // جلب أحدث المسلسلات المسجلة من Supabase مع مصفوفة حلقاتها لاكتشاف أي حلقة جديدة
+  // 1. فحص العناصر غير التابعة للمسلسلات المسجلة مسبقاً (لتخطي الأفلام والعروض الفردية الموجودة مسبقاً)
+  const nonSeriesPaths = items.filter(i => !i.isSeries).map(i => `"${i.path}"`);
+  const existingNonSeriesPaths = new Set();
+  if (nonSeriesPaths.length > 0) {
+    try {
+      const existing = await db(`contents?select=page_url&page_url=in.(${encodeURIComponent(nonSeriesPaths.join(','))})`);
+      if (existing && existing.length > 0) {
+        existing.forEach(r => existingNonSeriesPaths.add(r.page_url));
+      }
+    } catch (e) {
+      console.log('ملاحظة أثناء استرجاع المسارات المسجلة مسبقاً:', e.message);
+    }
+  }
+
+  // 2. تحميل كاش المسلسلات المسجلة لفحص الحلقات الجديدة
   const processedSeriesCache = new Map();
   try {
-    const existingSeries = await db(`contents?type=eq.series&select=title,page_url,extra_data&limit=300&order=id.desc`);
+    const existingSeries = await db(`contents?type=eq.series&select=title,page_url,extra_data&limit=350&order=id.desc`);
     if (existingSeries && existingSeries.length > 0) {
       existingSeries.forEach(r => {
         if (r.title) processedSeriesCache.set(r.title, r);
@@ -543,19 +549,22 @@ async function run() {
     console.log('ملاحظة أثناء تحميل كاش المسلسلات:', e.message);
   }
 
-  // فلترة ذكية: إذا كان فيلماً مسجلاً نتخطاه، أما إذا كان مسلسلاً فنفحص إن كانت الحلقة جديدة
   const filteredItems = [];
   const seenInCurrentPage = new Set();
 
   for (const item of items) {
+    // إذا كان فيلماً أو عرضاً فردياً مسجلاً مسبقاً برابطه، نتخطاه فوراً
+    if (!item.isSeries && existingNonSeriesPaths.has(item.path)) {
+      continue;
+    }
+
     const base = extractBaseTitle(item.title);
     if (item.isSeries) {
       const cached = processedSeriesCache.get(base);
       if (cached && cached.extra_data?.episodes) {
-        // فحص هل رابط هذه الحلقة موجود مسبقاً داخل حلقات المسلسل
         const episodeExists = cached.extra_data.episodes.some(ep => ep.url === item.path);
         if (episodeExists) {
-          continue; // تم حفظ هذه الحلقة مسبقاً داخل المسلسل -> تخطي
+          continue;
         } else {
           console.log(`🔥 [رصد حلقة جديدة لمسلسل مسجل]: ${item.title}`);
         }
@@ -568,9 +577,8 @@ async function run() {
     filteredItems.push(item);
   }
 
-  console.log(`✨ عناصر جديدة تستحق الفحص والتحديث: ${filteredItems.length} عنصر.`);
+  console.log(`✨ عناصر جديدة تستحق الفحص والتحديث: ${filteredItems.length} عنصر (تم تخطي ${items.length - filteredItems.length} مسجل مسبقاً).`);
 
-  // معالجة كافة العناصر المستحقة في الصفحة
   for (const item of filteredItems) {
     console.log(`🔍 بدء فحص: ${item.title}`);
     await scrapeSingleItem(browser, item, targetUrl, target.category, target.type, processedSeriesCache);
@@ -579,9 +587,6 @@ async function run() {
 
   await browser.close();
 
-  // -------------------------------------------------------------
-  // تدوير الأقسام والصفحات والانتقال إلى وضع المراقبة الحية الدائمة
-  // -------------------------------------------------------------
   let nextIndex = targetIndex + 1;
   let nextPage = page;
   let archiveFinished = state.initial_archive_done || 0;
@@ -592,11 +597,10 @@ async function run() {
       nextPage = page + 1;
       console.log(`🏁 اكتملت دورة الصفحة (${page}) لكافة الأقسام. الانتقال للصفحة (${nextPage})...`);
     } else {
-      nextPage = 1; // البقاء في وضع مراقبة الصفحة الأولى لكل الأقسام
+      nextPage = 1;
     }
   }
 
-  // عند تجاوز الصفحة 50 نعلن اكتمال الأرشفة والتحول الدائم للمراقبة الحية
   if (nextPage > 50) {
     nextPage = 1;
     archiveFinished = 1;
