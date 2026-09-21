@@ -83,7 +83,7 @@ async function solveTurnstileIfPresent(page) {
 async function safeNavigate(page, url, referer = '') {
   const options = { waitUntil: 'domcontentloaded', timeout: 60000 };
   if (referer) options.referer = referer;
-  
+
   await page.goto(url, options);
   let title = await page.title();
   let retries = 0;
@@ -104,11 +104,13 @@ function sanitizeTitle(rawTitle) {
     .replace(/\s*-\s*وي سيما.*$/i, '')
     .replace(/\s*-\s*ماي سيما.*$/i, '')
     .replace(/\s*اون\s*لاين/gi, '')
+    .replace(/\s*مترجمة?/gi, '')
+    .replace(/\s*مدبلجة?/gi, '')
     .replace(/\s*\(\s*\d{4}\s*\)\s*$/g, '')
     .trim();
 }
 
-async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targetType) {
+async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targetType, processedSeriesUrls) {
   const itemTab = await browser.newPage();
   await itemTab.setViewport({ width: 1920, height: 1080 });
   await itemTab.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36');
@@ -156,23 +158,53 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
     await new Promise(r => setTimeout(r, 1800));
 
     const pageDetails = await itemTab.evaluate(() => {
-      // 1. استخراج القصة
-      let story = '';
-      const storySelectors = [
-        '.StoryMovieContent', '.Story--Content', '.PostStory', '.single-story',
-        'div.Story', '.AsideContext div', '.Poster--Single-Content p', '.PostItemContent p'
-      ];
-      for (const sel of storySelectors) {
-        const el = document.querySelector(sel);
-        if (el && el.innerText.trim().length > 15) {
-          story = el.innerText.trim();
-          break;
+      // 1. استخراج رابط وهوية المسلسل الرئيسية إن وجد
+      let seriesTitle = null;
+      let seriesUrl = null;
+      
+      const seriesAnchor = document.querySelector('.Terms--Content--Single-begin li a[href*="/series/"]') ||
+                           document.querySelector('.Series--Section > a[href*="/series/"]');
+      if (seriesAnchor) {
+        seriesTitle = seriesAnchor.innerText.trim();
+        seriesUrl = seriesAnchor.getAttribute('href');
+      }
+
+      // 2. استخراج البوستر المباشر
+      let poster = '';
+      const metaOgImage = document.querySelector('meta[property="og:image"]');
+      const metaTwImage = document.querySelector('meta[name="twitter:image"]');
+      
+      if (metaOgImage && metaOgImage.content && !metaOgImage.content.includes('logo')) {
+        poster = metaOgImage.content;
+      } else if (metaTwImage && metaTwImage.content && !metaTwImage.content.includes('logo')) {
+        poster = metaTwImage.content;
+      }
+
+      if (!poster) {
+        const wecimaEl = document.querySelector('wecima');
+        if (wecimaEl && wecimaEl.getAttribute('style')) {
+          const m = wecimaEl.getAttribute('style').match(/--img:\s*url\(([^)]+)\)/i);
+          if (m) poster = m[1].replace(/['"]/g, '');
         }
       }
 
-      // 2. استخراج السيرفرات
+      if (!poster) {
+        const imgEl = document.querySelector('.Poster--Single-begin img, .wecima--single--poster img, [itemprop="image"]');
+        if (imgEl) {
+          poster = imgEl.getAttribute('data-src') || imgEl.getAttribute('data-lazy-src') || imgEl.src || '';
+        }
+      }
+
+      // 3. القصة
+      let story = '';
+      const storyEl = document.querySelector('.StoryMovieContent, .AsideContext .StoryMovieContent, .PostStory, [itemprop="description"]');
+      if (storyEl) {
+        story = storyEl.innerText.trim();
+      }
+
+      // 4. السيرفرات
       const domServers = [];
-      document.querySelectorAll('ul#watch li, .WatchServersList li, [data-watch], [data-url]').forEach(li => {
+      document.querySelectorAll('ul#watch li, .WatchServersList li, [data-watch]').forEach(li => {
         let url = li.getAttribute('data-watch') || li.getAttribute('data-url');
         const name = li.innerText.trim() || 'سيرفر مشاهدة';
         if (url && !url.startsWith('#') && !url.startsWith('javascript:')) {
@@ -181,78 +213,75 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
         }
       });
 
-      // 3. التقييم
+      // 5. التقييم
       let rating = null;
-      const rateEl = document.querySelector('.IMDB--Rating, .Rate--Single, [itemprop="ratingValue"], .imdb, .rating');
+      const rateEl = document.querySelector('.IMDB--Rating, .Rate--Single, [itemprop="ratingValue"]');
       if (rateEl) {
         const match = rateEl.innerText.match(/(\d+(\.\d+)?)/);
         if (match) rating = parseFloat(match[1]);
       }
 
-      // 4. التصنيفات
+      // 6. التصنيفات
       const genres = [];
-      document.querySelectorAll('a[href*="/genre/"], .Terms--List li a').forEach(a => {
+      document.querySelectorAll('a[href*="/genre/"]').forEach(a => {
         const txt = a.innerText.trim();
         if (txt && !genres.includes(txt)) genres.push(txt);
       });
 
-      // 5. استخراج بوستر عالي الدقة من داخل الصفحة إن وجد كبديل احتياطي
-      let innerPoster = '';
-      const singlePosterImg = document.querySelector('.Poster--Single-begin img, .wecima--single--poster img, [itemprop="image"]');
-      if (singlePosterImg) {
-        innerPoster = singlePosterImg.getAttribute('data-src') || singlePosterImg.getAttribute('data-lazy-src') || singlePosterImg.src || '';
-      }
-      if (!innerPoster) {
-        const bgSingle = document.querySelector('.Poster--Single-begin, .wecima--single--poster');
-        if (bgSingle && bgSingle.getAttribute('style')) {
-          const m = bgSingle.getAttribute('style').match(/url\(['"]?([^'")]+)['"]?\)/i);
-          if (m) innerPoster = m[1];
-        }
-      }
-
-      // 6. استخراج مواسم وحلقات المسلسل كاملة من الصفحة
+      // 7. استخراج قائمة الحلقات بالكامل من جدول الحلقات الفعلي
       const episodesList = [];
-      document.querySelectorAll('.Episodes--Seasons--Episodes a, a[href*="/episode/"]').forEach(a => {
+      document.querySelectorAll('.EpisodesList a').forEach(a => {
         const href = a.getAttribute('href');
-        const epTitle = a.innerText.trim();
-        const epNumMatch = epTitle.match(/(\d+)/);
+        const titleEl = a.querySelector('episodetitle') || a;
+        const epTitle = titleEl.innerText.trim();
+        const numMatch = epTitle.match(/(\d+)/);
         if (href) {
           episodesList.push({
             title: epTitle,
             url: href,
-            episode_number: epNumMatch ? parseInt(epNumMatch[1], 10) : null
+            episode_number: numMatch ? parseInt(numMatch[1], 10) : null
           });
         }
       });
 
-      // رابط المسلسل الأصلي
-      let seriesTitle = null;
-      let seriesUrl = null;
-      const seriesAnchor = document.querySelector('.Terms--Content--Single-begin li a[href*="/series/"]');
-      if (seriesAnchor) {
-        seriesTitle = seriesAnchor.innerText.trim();
-        seriesUrl = seriesAnchor.getAttribute('href');
-      }
+      // 8. استخراج المواسم
+      const seasonsList = [];
+      document.querySelectorAll('.SeasonsList ul li a').forEach(a => {
+        seasonsList.push({
+          title: a.innerText.trim(),
+          season_id: a.getAttribute('data-season') || null,
+          url: a.getAttribute('href') || null
+        });
+      });
 
       const h1Text = document.querySelector('h1[itemprop="name"]')?.innerText || document.title;
       const seasonMatch = h1Text.match(/الموسم\s+([^\s]+)/);
       const episodeMatch = h1Text.match(/الحلقة\s+(\d+)/);
 
       return {
+        seriesTitle,
+        seriesUrl,
+        poster,
         story,
         domServers,
         rating,
         genres,
-        innerPoster,
         episodesList,
-        seriesTitle,
-        seriesUrl,
+        seasonsList,
         seasonName: seasonMatch ? seasonMatch[1] : null,
         episodeNumber: episodeMatch ? parseInt(episodeMatch[1], 10) : null
       };
     });
 
     itemTab.off('request', networkSniffer);
+
+    // التحقق من تكرار المسلسل: إذا كان المسلسل قد عولج في نفس الجلسة أو مسجل برابطه الأم
+    const seriesKey = pageDetails.seriesUrl || (pageDetails.seriesTitle ? sanitizeTitle(pageDetails.seriesTitle) : null);
+    if (seriesKey && processedSeriesUrls.has(seriesKey)) {
+      console.log(`⏩ [تخطي تكرار]: تم معالجة وتخزين المسلسل مسبقاً (${pageDetails.seriesTitle || item.title})`);
+      await itemTab.close().catch(() => {});
+      return true;
+    }
 
     const allServers = [...capturedEmbeds, ...pageDetails.domServers];
     if (directPlayUrl) allServers.unshift({ name: 'بث مباشر رئيسي (Direct)', url: directPlayUrl });
@@ -266,23 +295,31 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
       }
     }
 
-    // الاعتماد على أفضل رابط للبوستر (الداخلي أو المستخرج من شبكة العرض)
-    const resolvedPoster = pageDetails.innerPoster || item.poster || '';
+    let finalPoster = pageDetails.poster || item.poster || '';
+    if (finalPoster.startsWith('//')) finalPoster = 'https:' + finalPoster;
+
     const isSeriesItem = targetType === 'series' || item.isSeries || pageDetails.seriesTitle !== null;
     const contentType = isSeriesItem ? 'series' : targetType;
-    const cleanTitle = sanitizeTitle(item.title);
+
+    // استخدام اسم المسلسل الرئيسي عنواناً للمسلسلات بدلاً من اسم الحلقة المفردة
+    const finalTitle = isSeriesItem && pageDetails.seriesTitle 
+      ? sanitizeTitle(pageDetails.seriesTitle) 
+      : sanitizeTitle(item.title);
+
+    // إذا كان مسلسلاً، نعتمد رابط المسلسل كـ page_url لتجنب إنشاء صف لكل حلقة، وإلا نستخدم رابط الصفحة
+    const finalPageUrl = isSeriesItem && pageDetails.seriesUrl ? pageDetails.seriesUrl : item.path;
 
     await db('contents?on_conflict=page_url', {
       method: 'POST',
       headers: { 'Prefer': 'resolution=merge-duplicates' },
       body: JSON.stringify([{
-        title: cleanTitle,
+        title: finalTitle,
         type: contentType,
         category: targetCategory,
         year: item.year,
-        poster_url: resolvedPoster,
+        poster_url: finalPoster,
         stream_url: directPlayUrl || finalServers[0]?.url || detailUrl,
-        page_url: item.path,
+        page_url: finalPageUrl,
         extra_data: {
           original_title: item.title,
           servers: finalServers,
@@ -294,7 +331,7 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
           series_url: pageDetails.seriesUrl || null,
           season_name: pageDetails.seasonName || null,
           episode_number: pageDetails.episodeNumber || null,
-          // قائمة الحلقات المكتشفة داخل الصفحة
+          seasons: pageDetails.seasonsList.length > 0 ? pageDetails.seasonsList : undefined,
           episodes: pageDetails.episodesList.length > 0 ? pageDetails.episodesList : undefined,
           status: 'success'
         },
@@ -302,7 +339,9 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
       }])
     });
 
-    console.log(`✅ تم الحفظ: ${cleanTitle} | بوستر: ${resolvedPoster ? 'متوفر' : 'غير متوفر'} | حلقات: ${pageDetails.episodesList.length}`);
+    if (seriesKey) processedSeriesUrls.add(seriesKey);
+
+    console.log(`✅ تم الحفظ: ${finalTitle} | بوستر: ${finalPoster ? 'متوفر' : 'غير متوفر'} | حلقات: ${pageDetails.episodesList.length}`);
     await itemTab.close().catch(() => {});
     return true;
 
@@ -314,7 +353,7 @@ async function scrapeSingleItem(browser, item, refererUrl, targetCategory, targe
 }
 
 async function run() {
-  console.log('🚀 بدء تشغيل الكاشط مع معالجة البوستر والحلقات...');
+  console.log('🚀 بدء تشغيل الكاشط (معالجة البوسترات للأفلام والمسلسلات + منع التكرار)...');
 
   let state = (await db('scraper_state?id=eq.1&select=*'))?.[0];
   if (!state) {
@@ -345,7 +384,7 @@ async function run() {
   await safeNavigate(mainTab, `${PRIMARY_DOMAIN}/`);
   await safeNavigate(mainTab, targetUrl, `${PRIMARY_DOMAIN}/`);
 
-  // استخراج العناصر مع فحص شامل لروابط الصور وخلفيات الـ CSS
+  // استخراج العناصر من شبكة العرض والتقاط الـ data-lazy-style و CSS variables
   const rawItems = await mainTab.evaluate(() => {
     const list = [];
     document.querySelectorAll('.Thumb--GridItem').forEach(el => {
@@ -359,33 +398,23 @@ async function run() {
       const title = titleEl ? titleEl.innerText.trim() : (linkEl.getAttribute('title') || '');
       if (!title) return;
 
-      // 1. فحص شامل للبوستر: فحص style العنصر الرئيسي والأبناء، ومختلف سمات <img>
+      // فحص شامل لصور البطاقات في واجهة القسم (أفلام ومسلسلات)
       let poster = '';
-      
-      // أ. فحص وسم img وسمات Lazy-loading
-      const img = el.querySelector('img');
-      if (img) {
-        poster = img.getAttribute('data-src') || 
-                 img.getAttribute('data-lazy-src') || 
-                 img.getAttribute('data-original') || 
-                 img.src || '';
+
+      const bgSpan = el.querySelector('.BG--GridItem');
+      if (bgSpan) {
+        const lazyStyle = bgSpan.getAttribute('data-lazy-style') || bgSpan.getAttribute('style') || '';
+        const match = lazyStyle.match(/--image:\s*url\(([^)]+)\)/i) || lazyStyle.match(/url\(['"]?([^'")]+)['"]?\)/i);
+        if (match) poster = match[1].replace(/['"]/g, '');
       }
 
-      // ب. فحص خلفيات CSS في مختلف العناصر المحتملة
-      if (!poster || poster.includes('data:image')) {
-        const bgElements = [el, el.querySelector('.BG--GridItem'), el.querySelector('.image'), el.querySelector('span')];
-        for (const targetEl of bgElements) {
-          if (!targetEl) continue;
-          const inlineStyle = targetEl.getAttribute('style') || '';
-          const bgMatch = inlineStyle.match(/url\(['"]?([^'")]+)['"]?\)/i) || inlineStyle.match(/--image:\s*url\(['"]?([^'")]+)['"]?\)/i);
-          if (bgMatch && bgMatch[1] && !bgMatch[1].includes('data:image')) {
-            poster = bgMatch[1];
-            break;
-          }
+      if (!poster) {
+        const img = el.querySelector('img');
+        if (img) {
+          poster = img.getAttribute('data-src') || img.getAttribute('data-lazy-src') || img.src || '';
         }
       }
 
-      // تصحيح الرابط النسبي إذا لزم الأمر
       if (poster && poster.startsWith('//')) poster = 'https:' + poster;
 
       const yearMatch = el.innerText.match(/\b(19\d\d|20\d\d)\b/);
@@ -399,27 +428,46 @@ async function run() {
 
   await mainTab.close().catch(() => {});
 
+  // فلترة العناصر الفريدة المستخرجة من الصفحة
   const uniqueMap = new Map();
   for (const it of rawItems) {
     if (!uniqueMap.has(it.path)) uniqueMap.set(it.path, it);
   }
   const items = Array.from(uniqueMap.values());
-
   console.log(`📦 العناصر المستخرجة: ${items.length} عنصر.`);
 
-  for (const item of items.slice(0, 10)) {
+  // فحص قاعدة البيانات لتخطي العناصر التي تمت أرشفتها مسبقاً (تخطي التكرار)
+  const pathsToCheck = items.map(i => `"${i.path}"`).join(',');
+  let existingUrls = new Set();
+  try {
+    const existing = await db(`contents?select=page_url&page_url=in.(${encodeURIComponent(pathsToCheck)})`);
+    if (existing && existing.length > 0) {
+      existing.forEach(r => existingUrls.add(r.page_url));
+    }
+  } catch (e) {
+    console.log('ملاحظة أثناء فحص التكرار المسبق:', e.message);
+  }
+
+  const itemsToProcess = items.filter(it => !existingUrls.has(it.path));
+  console.log(`✨ عناصر جديدة تتطلب المعالجة بعد فحص التكرار: ${itemsToProcess.length} (تم تخطي ${items.length - itemsToProcess.length} مكرر).`);
+
+  const processedSeriesUrls = new Set();
+
+  for (const item of itemsToProcess.slice(0, 10)) {
     console.log(`🔍 بدء فحص: ${item.title}`);
-    await scrapeSingleItem(browser, item, targetUrl, target.category, target.type);
+    await scrapeSingleItem(browser, item, targetUrl, target.category, target.type, processedSeriesUrls);
     await new Promise(r => setTimeout(r, 600));
   }
 
   await browser.close();
 
+  // تدوير الأقسام والصفحات
   let nextIndex = targetIndex + 1;
   let nextPage = page;
   if (nextIndex >= CATEGORY_ORDER.length) {
     nextIndex = 0;
     nextPage = page + 1;
+    console.log(`🏁 اكتملت دورة الصفحة (${page}) لجميع الأقسام الـ 18. الانتقال للصفحة (${nextPage})...`);
   }
   if (nextPage > 50) nextPage = 1;
 
